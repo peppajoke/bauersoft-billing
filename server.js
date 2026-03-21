@@ -101,55 +101,85 @@ const requireClient = (req, res, next) => {
 
 // ── DB Schema ─────────────────────────────────────────────────────────────────
 async function initDb() {
+  // ── accounts ─────────────────────────────────────────────────────────────
+  // One row per business using this billing system.
+  // 'bauersoft' = Jack's own account (default). House of Photos etc. get their own.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS accounts (
+      id                TEXT PRIMARY KEY,
+      name              TEXT NOT NULL,
+      email             TEXT,
+      stripe_account_id TEXT,
+      settings          JSONB DEFAULT '{}',
+      created_at        TIMESTAMPTZ DEFAULT NOW(),
+      updated_at        TIMESTAMPTZ DEFAULT NOW()
+    )
+  `)
+  await pool.query(`
+    INSERT INTO accounts (id, name, email)
+    VALUES ('bauersoft', 'BauerSoft', 'billing@bauersoft.io')
+    ON CONFLICT (id) DO NOTHING
+  `)
+
+  // ── clients ───────────────────────────────────────────────────────────────
+  // The people being billed, scoped to an account.
   await pool.query(`
     CREATE TABLE IF NOT EXISTS clients (
-      id          TEXT PRIMARY KEY,
-      name        TEXT NOT NULL,
-      email       TEXT NOT NULL UNIQUE,
-      company     TEXT,
-      phone       TEXT,
-      address     TEXT,
-      notes               TEXT,
-      stripe_customer_id  TEXT,
-      created_at          TIMESTAMPTZ DEFAULT NOW(),
-      updated_at          TIMESTAMPTZ DEFAULT NOW()
+      id                 TEXT PRIMARY KEY,
+      account_id         TEXT NOT NULL DEFAULT 'bauersoft' REFERENCES accounts(id),
+      name               TEXT NOT NULL,
+      email              TEXT NOT NULL,
+      company            TEXT,
+      phone              TEXT,
+      address            TEXT,
+      notes              TEXT,
+      stripe_customer_id TEXT,
+      created_at         TIMESTAMPTZ DEFAULT NOW(),
+      updated_at         TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (account_id, email)
     )
   `)
-
-  // Add stripe_customer_id if missing (safe migration)
+  // Safe migrations
+  await pool.query(`ALTER TABLE clients ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'bauersoft'`)
   await pool.query(`ALTER TABLE clients ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`)
 
+  // ── magic_links ───────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS magic_links (
-      token       TEXT PRIMARY KEY,
-      client_id   TEXT REFERENCES clients(id) ON DELETE CASCADE,
-      expires_at  TIMESTAMPTZ NOT NULL,
-      used        BOOLEAN DEFAULT FALSE,
-      created_at  TIMESTAMPTZ DEFAULT NOW()
+      token      TEXT PRIMARY KEY,
+      client_id  TEXT REFERENCES clients(id) ON DELETE CASCADE,
+      expires_at TIMESTAMPTZ NOT NULL,
+      used       BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `)
 
+  // ── projects ──────────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS projects (
-      id           TEXT PRIMARY KEY,
-      client_id    TEXT REFERENCES clients(id) ON DELETE SET NULL,
-      name         TEXT NOT NULL,
-      description  TEXT,
-      status       TEXT DEFAULT 'active',
-      type         TEXT DEFAULT 'fixed',
-      total_value  NUMERIC(10,2),
-      start_date   DATE,
-      end_date     DATE,
-      notes        TEXT,
-      created_at   TIMESTAMPTZ DEFAULT NOW(),
-      updated_at   TIMESTAMPTZ DEFAULT NOW()
+      id          TEXT PRIMARY KEY,
+      account_id  TEXT NOT NULL DEFAULT 'bauersoft' REFERENCES accounts(id),
+      client_id   TEXT REFERENCES clients(id) ON DELETE SET NULL,
+      name        TEXT NOT NULL,
+      description TEXT,
+      status      TEXT DEFAULT 'active',
+      type        TEXT DEFAULT 'fixed',
+      total_value NUMERIC(10,2),
+      start_date  DATE,
+      end_date    DATE,
+      notes       TEXT,
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      updated_at  TIMESTAMPTZ DEFAULT NOW()
     )
   `)
+  await pool.query(`ALTER TABLE projects ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'bauersoft'`)
 
+  // ── invoices ──────────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS invoices (
       id                       TEXT PRIMARY KEY,
-      invoice_number           TEXT UNIQUE NOT NULL,
+      account_id               TEXT NOT NULL DEFAULT 'bauersoft' REFERENCES accounts(id),
+      invoice_number           TEXT NOT NULL,
       client_id                TEXT REFERENCES clients(id) ON DELETE SET NULL,
       project_id               TEXT REFERENCES projects(id) ON DELETE SET NULL,
       status                   TEXT DEFAULT 'draft',
@@ -160,45 +190,53 @@ async function initDb() {
       total                    NUMERIC(10,2) NOT NULL DEFAULT 0,
       due_date                 DATE,
       paid_at                  TIMESTAMPTZ,
-      stripe_payment_link_id   TEXT,
       stripe_payment_link_url  TEXT,
       stripe_payment_intent_id TEXT,
       notes                    TEXT,
       created_at               TIMESTAMPTZ DEFAULT NOW(),
-      updated_at               TIMESTAMPTZ DEFAULT NOW()
+      updated_at               TIMESTAMPTZ DEFAULT NOW(),
+      UNIQUE (account_id, invoice_number)
     )
   `)
+  await pool.query(`ALTER TABLE invoices ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'bauersoft'`)
 
+  // ── invoice_line_items ────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS invoice_line_items (
-      id           TEXT PRIMARY KEY,
-      invoice_id   TEXT REFERENCES invoices(id) ON DELETE CASCADE,
-      description  TEXT NOT NULL,
-      quantity     NUMERIC(10,2) DEFAULT 1,
-      unit_price   NUMERIC(10,2) NOT NULL,
-      amount       NUMERIC(10,2) NOT NULL,
-      sort_order   INT DEFAULT 0
+      id          TEXT PRIMARY KEY,
+      invoice_id  TEXT REFERENCES invoices(id) ON DELETE CASCADE,
+      description TEXT NOT NULL,
+      quantity    NUMERIC(10,2) DEFAULT 1,
+      unit_price  NUMERIC(10,2) NOT NULL,
+      amount      NUMERIC(10,2) NOT NULL,
+      sort_order  INT DEFAULT 0
     )
   `)
 
+  // ── contacts ──────────────────────────────────────────────────────────────
   await pool.query(`
     CREATE TABLE IF NOT EXISTS contacts (
-      id          TEXT PRIMARY KEY,
-      name        TEXT,
-      email       TEXT,
-      message     TEXT NOT NULL,
-      source      TEXT DEFAULT 'website',
-      status      TEXT DEFAULT 'new',
-      created_at  TIMESTAMPTZ DEFAULT NOW()
+      id         TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL DEFAULT 'bauersoft' REFERENCES accounts(id),
+      name       TEXT,
+      email      TEXT,
+      message    TEXT NOT NULL,
+      source     TEXT DEFAULT 'website',
+      status     TEXT DEFAULT 'new',
+      created_at TIMESTAMPTZ DEFAULT NOW()
     )
   `)
+  await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'bauersoft'`)
 
   console.log('[DB] Schema ready')
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-async function nextInvoiceNumber() {
-  const { rows } = await pool.query(`SELECT invoice_number FROM invoices ORDER BY created_at DESC LIMIT 100`)
+async function nextInvoiceNumber(accountId = 'bauersoft') {
+  const { rows } = await pool.query(
+    `SELECT invoice_number FROM invoices WHERE account_id=$1 ORDER BY created_at DESC LIMIT 100`,
+    [accountId]
+  )
   const nums = rows.map(r => parseInt(r.invoice_number.replace('INV-', '')) || 0)
   const next = nums.length ? Math.max(...nums) + 1 : 1
   return `INV-${String(next).padStart(4, '0')}`
@@ -243,6 +281,40 @@ function invoiceEmailHtml(invoice, lineItems, paymentUrl) {
 
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, service: 'bauersoft-billing' }))
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ADMIN — ACCOUNTS
+// ─────────────────────────────────────────────────────────────────────────────
+
+app.get('/api/accounts', requireAdmin, async (req, res) => {
+  const { rows } = await pool.query(`SELECT * FROM accounts ORDER BY created_at ASC`)
+  res.json(rows)
+})
+
+app.post('/api/accounts', requireAdmin, async (req, res) => {
+  const { id, name, email, settings } = req.body
+  if (!id || !name) return res.status(400).json({ error: 'id and name required' })
+  const { rows } = await pool.query(
+    `INSERT INTO accounts (id, name, email, settings) VALUES ($1,$2,$3,$4) RETURNING *`,
+    [id, name, email || null, JSON.stringify(settings || {})]
+  )
+  res.status(201).json(rows[0])
+})
+
+app.patch('/api/accounts/:id', requireAdmin, async (req, res) => {
+  const { name, email, stripe_account_id, settings } = req.body
+  const updates = []
+  const vals = [req.params.id]
+  if (name)              { vals.push(name);              updates.push(`name=$${vals.length}`) }
+  if (email)             { vals.push(email);             updates.push(`email=$${vals.length}`) }
+  if (stripe_account_id) { vals.push(stripe_account_id); updates.push(`stripe_account_id=$${vals.length}`) }
+  if (settings)          { vals.push(JSON.stringify(settings)); updates.push(`settings=$${vals.length}`) }
+  if (!updates.length) return res.status(400).json({ error: 'No valid fields' })
+  const { rows } = await pool.query(
+    `UPDATE accounts SET ${updates.join(',')}, updated_at=NOW() WHERE id=$1 RETURNING *`, vals
+  )
+  res.json(rows[0])
+})
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ADMIN AUTH
@@ -486,7 +558,7 @@ app.get('/api/invoices/:id', requireAdmin, async (req, res) => {
 })
 
 app.post('/api/invoices', requireAdmin, async (req, res) => {
-  const { client_id, project_id, line_items = [], due_date, notes, tax_rate = 0, currency = 'usd' } = req.body
+  const { client_id, project_id, line_items = [], due_date, notes, tax_rate = 0, currency = 'usd', account_id = 'bauersoft' } = req.body
   if (!client_id) return res.status(400).json({ error: 'client_id required' })
   if (!line_items.length) return res.status(400).json({ error: 'At least one line item required' })
 
@@ -496,13 +568,13 @@ app.post('/api/invoices', requireAdmin, async (req, res) => {
     amount: +(parseFloat(li.quantity || 1) * parseFloat(li.unit_price)).toFixed(2)
   }))
   const totals = calcTotals(enrichedItems, tax_rate)
-  const invoiceNumber = await nextInvoiceNumber()
+  const invoiceNumber = await nextInvoiceNumber(account_id)
 
   const id = uuid()
   const { rows } = await pool.query(
-    `INSERT INTO invoices (id,invoice_number,client_id,project_id,currency,subtotal,tax_rate,tax_amount,total,due_date,notes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
-    [id, invoiceNumber, client_id, project_id||null, currency,
+    `INSERT INTO invoices (id,account_id,invoice_number,client_id,project_id,currency,subtotal,tax_rate,tax_amount,total,due_date,notes)
+     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+    [id, account_id, invoiceNumber, client_id, project_id||null, currency,
      totals.subtotal, tax_rate, totals.tax_amount, totals.total, due_date||null, notes||null]
   )
 
