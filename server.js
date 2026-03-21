@@ -279,6 +279,42 @@ function invoiceEmailHtml(invoice, lineItems, paymentUrl) {
   </div>`
 }
 
+// ── Static files ─────────────────────────────────────────────────────────────
+const path = require('path')
+app.use(express.static(path.join(__dirname, 'public')))
+
+// SPA routes
+app.get('/admin', (req, res) => res.sendFile(path.join(__dirname, 'public', 'admin.html')))
+app.get('/portal', (req, res) => res.sendFile(path.join(__dirname, 'public', 'portal.html')))
+
+// Magic link verify → redirect to portal with token param (for email clients that strip JS)
+app.get('/auth/verify', async (req, res) => {
+  const { token: magicToken } = req.query
+  if (!magicToken) return res.redirect('/portal.html?error=missing_token')
+  try {
+    const { rows } = await pool.query(
+      `SELECT * FROM magic_links WHERE token=$1 AND used=FALSE AND expires_at > NOW()`,
+      [magicToken]
+    )
+    if (!rows[0]) return res.redirect('/portal.html?error=expired')
+    const link = rows[0]
+    await pool.query(`UPDATE magic_links SET used=TRUE WHERE token=$1`, [magicToken])
+    const { rows: clients } = await pool.query(`SELECT * FROM clients WHERE id=$1`, [link.client_id])
+    const client = clients[0]
+    if (!client) return res.redirect('/portal.html?error=not_found')
+    const sessionToken = signToken({ clientId: client.id, email: client.email, role: 'client' }, '30d')
+    // Return JSON for JS-driven verification, or redirect with token for email clients
+    const accept = req.headers.accept || ''
+    if (accept.includes('application/json')) {
+      return res.json({ token: sessionToken, client: { id: client.id, name: client.name, email: client.email } })
+    }
+    res.redirect(`/portal.html?session=${sessionToken}`)
+  } catch(e) {
+    console.error('verify error:', e)
+    res.redirect('/portal.html?error=server')
+  }
+})
+
 // ── Health ────────────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true, service: 'bauersoft-billing' }))
 
@@ -782,6 +818,48 @@ app.get('/api/stats', requireAdmin, async (req, res) => {
     contacts:    { total: +contacts.rows[0].total, unread: +contacts.rows[0].unread },
     revenue:     { paid: inv.paid?.amount || 0, outstanding: (inv.sent?.amount || 0) + (inv.overdue?.amount || 0) },
   })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CLIENT PORTAL API
+// ─────────────────────────────────────────────────────────────────────────────
+
+// GET /api/portal/invoices — client's own invoices
+app.get('/api/portal/invoices', requireClient, async (req, res) => {
+  try {
+    const { rows: clientRows } = await pool.query(`SELECT * FROM clients WHERE id=$1`, [req.clientId])
+    const client = clientRows[0]
+    const { rows } = await pool.query(`
+      SELECT i.*,
+             json_agg(li.* ORDER BY li.sort_order) FILTER (WHERE li.id IS NOT NULL) AS line_items
+      FROM invoices i
+      LEFT JOIN invoice_line_items li ON li.invoice_id = i.id
+      WHERE i.client_id = $1 AND i.status != 'draft'
+      GROUP BY i.id
+      ORDER BY i.created_at DESC
+    `, [req.clientId])
+    res.json({ client, invoices: rows })
+  } catch(e) {
+    console.error(e); res.status(500).json({ error: 'Server error' })
+  }
+})
+
+// GET /api/portal/invoices/:id — single invoice with line items
+app.get('/api/portal/invoices/:id', requireClient, async (req, res) => {
+  try {
+    const { rows } = await pool.query(`
+      SELECT i.*,
+             json_agg(li.* ORDER BY li.sort_order) FILTER (WHERE li.id IS NOT NULL) AS line_items
+      FROM invoices i
+      LEFT JOIN invoice_line_items li ON li.invoice_id = i.id
+      WHERE i.id = $1 AND i.client_id = $2
+      GROUP BY i.id
+    `, [req.params.id, req.clientId])
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' })
+    res.json(rows[0])
+  } catch(e) {
+    console.error(e); res.status(500).json({ error: 'Server error' })
+  }
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BauerSoft — Client Portal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" />
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body style="background:var(--bg)">
+
+<!-- Magic link verify / email request screen -->
+<div id="auth-screen" class="auth-wrap hidden">
+  <div class="auth-box">
+    <h1>Client Portal</h1>
+    <p>Enter your email address and we'll send you a secure login link.</p>
+    <div class="form-group">
+      <label>Email Address</label>
+      <input type="email" id="portal-email" placeholder="you@example.com" />
+    </div>
+    <button class="btn btn-primary" style="width:100%" onclick="requestLink()">Send Login Link</button>
+    <div id="auth-msg" class="mt-16 hidden" style="font-size:13px;text-align:center;color:var(--green)"></div>
+    <div id="auth-error" class="mt-16 hidden" style="font-size:13px;text-align:center;color:var(--red)"></div>
+  </div>
+</div>
+
+<!-- Verified portal -->
+<div id="portal-screen" class="hidden" style="background:var(--bg);min-height:100vh">
+  <div style="background:var(--surface);border-bottom:1px solid var(--border);padding:0 24px;height:56px;display:flex;align-items:center;justify-content:space-between">
+    <div style="font-size:15px;font-weight:700">BauerSoft <span style="color:var(--muted);font-weight:400">/ Client Portal</span></div>
+    <div style="display:flex;align-items:center;gap:16px">
+      <span id="portal-name" style="font-size:13px;color:var(--muted)"></span>
+      <button class="btn btn-ghost btn-sm" onclick="portalLogout()">Sign Out</button>
+    </div>
+  </div>
+
+  <div class="portal-wrap">
+    <div class="portal-header">
+      <h1>Your Invoices</h1>
+      <p>View and pay outstanding invoices from BauerSoft.</p>
+    </div>
+
+    <div id="portal-invoices"></div>
+    <div id="portal-empty" class="hidden empty" style="margin-top:40px">
+      <p>No invoices found.</p>
+    </div>
+  </div>
+</div>
+
+<!-- Invoice detail modal -->
+<div id="inv-detail-modal" class="modal-overlay hidden">
+  <div class="modal" style="width:580px">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px">
+      <div>
+        <h2 id="det-number" style="font-size:20px"></h2>
+        <div id="det-status" style="margin-top:4px"></div>
+      </div>
+      <button class="btn btn-ghost btn-sm" onclick="closePortalModal()">Close</button>
+    </div>
+
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:20px;font-size:13px">
+      <div><div style="color:var(--muted);margin-bottom:4px">Issued</div><div id="det-issued"></div></div>
+      <div><div style="color:var(--muted);margin-bottom:4px">Due</div><div id="det-due"></div></div>
+    </div>
+
+    <div class="table-wrap" style="margin-bottom:20px">
+      <table>
+        <thead><tr><th>Description</th><th>Qty</th><th>Unit</th><th>Amount</th></tr></thead>
+        <tbody id="det-lines"></tbody>
+        <tfoot>
+          <tr id="det-tax-row" class="hidden"><td colspan="3" style="text-align:right;color:var(--muted);font-size:12px">Tax</td><td id="det-tax"></td></tr>
+          <tr style="font-weight:700"><td colspan="3" style="text-align:right">Total</td><td id="det-total"></td></tr>
+        </tfoot>
+      </table>
+    </div>
+
+    <div id="det-notes" style="font-size:13px;color:var(--muted);margin-bottom:20px;padding:12px;background:var(--surface2);border-radius:var(--radius)"></div>
+
+    <div id="det-pay-btn"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script>
+const API = ''
+let portalToken = localStorage.getItem('bs_portal_token')
+let currentInvoice = null
+
+window.onload = async () => {
+  const params = new URLSearchParams(window.location.search)
+  // Magic link token (JS-driven verify via fetch)
+  const magicToken = params.get('token')
+  if (magicToken) { await verifyToken(magicToken); return }
+  // Session token injected by server redirect (for plain email clients)
+  const sessionToken = params.get('session')
+  if (sessionToken) {
+    portalToken = sessionToken
+    localStorage.setItem('bs_portal_token', portalToken)
+    history.replaceState({}, '', '/portal.html')
+    showPortal(); return
+  }
+  if (params.get('error')) showError({ missing_token: 'Invalid link', expired: 'This link has expired — request a new one.', not_found: 'Account not found.', server: 'Server error — try again.' }[params.get('error')] || 'Something went wrong')
+  if (portalToken) showPortal()
+  else showAuth()
+}
+
+function showAuth() {
+  document.getElementById('auth-screen').classList.remove('hidden')
+  document.getElementById('portal-screen').classList.add('hidden')
+  document.getElementById('portal-email').addEventListener('keydown', e => {
+    if (e.key === 'Enter') requestLink()
+  })
+}
+
+async function verifyToken(t) {
+  try {
+    const r = await fetch(`/auth/verify?token=${t}`)
+    const d = await r.json()
+    if (!r.ok) throw new Error(d.error || 'Invalid link')
+    portalToken = d.token
+    localStorage.setItem('bs_portal_token', portalToken)
+    // Clean URL
+    history.replaceState({}, '', '/portal.html')
+    showPortal()
+  } catch(e) {
+    showAuth()
+    showError(e.message)
+  }
+}
+
+async function requestLink() {
+  const email = document.getElementById('portal-email').value.trim()
+  if (!email) return
+  const r = await fetch('/api/auth/magic-link', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email })
+  })
+  const d = await r.json()
+  document.getElementById('auth-msg').textContent = 'Check your email for a login link.'
+  document.getElementById('auth-msg').classList.remove('hidden')
+}
+
+async function showPortal() {
+  document.getElementById('auth-screen').classList.add('hidden')
+  document.getElementById('portal-screen').classList.remove('hidden')
+
+  const r = await fetch('/api/portal/invoices', {
+    headers: { 'Authorization': `Bearer ${portalToken}` }
+  })
+  if (r.status === 401) { portalLogout(); return }
+  const data = await r.json()
+
+  if (data.client) {
+    document.getElementById('portal-name').textContent = data.client.name
+  }
+
+  const invoices = data.invoices || []
+  const container = document.getElementById('portal-invoices')
+
+  if (!invoices.length) {
+    document.getElementById('portal-empty').classList.remove('hidden')
+    return
+  }
+
+  container.innerHTML = invoices.map(inv => {
+    const isPaid = inv.status === 'paid'
+    const isOverdue = !isPaid && inv.due_date && new Date(inv.due_date) < new Date()
+    const statusClass = isPaid ? 'badge-paid' : isOverdue ? 'badge-overdue' : 'badge-sent'
+    const statusLabel = isPaid ? 'Paid' : isOverdue ? 'Overdue' : 'Due'
+    return `
+    <div class="invoice-card" style="cursor:pointer" onclick="openInvDetail('${inv.id}')">
+      <div class="inv-info">
+        <h3>${inv.invoice_number}</h3>
+        <p>${inv.notes ? inv.notes.substring(0, 60) : 'Click to view details'}</p>
+      </div>
+      <div style="display:flex;align-items:center;gap:16px">
+        <span class="badge ${statusClass}">${statusLabel}</span>
+        <div class="inv-amount">
+          ${fmt(inv.total)}
+          <small>${inv.due_date ? 'Due ' + fmtDate(inv.due_date) : ''}</small>
+        </div>
+        ${!isPaid && inv.stripe_payment_link_url
+          ? `<a href="${inv.stripe_payment_link_url}" target="_blank" class="btn btn-primary btn-sm" onclick="event.stopPropagation()">Pay Now</a>`
+          : ''}
+      </div>
+    </div>
+  `}).join('')
+}
+
+async function openInvDetail(id) {
+  const r = await fetch(`/api/portal/invoices/${id}`, {
+    headers: { 'Authorization': `Bearer ${portalToken}` }
+  })
+  const inv = await r.json()
+  currentInvoice = inv
+
+  document.getElementById('det-number').textContent = inv.invoice_number
+  document.getElementById('det-status').innerHTML = `<span class="badge badge-${inv.status}">${inv.status}</span>`
+  document.getElementById('det-issued').textContent = fmtDate(inv.created_at)
+  document.getElementById('det-due').textContent = fmtDate(inv.due_date)
+
+  const lines = inv.line_items || []
+  document.getElementById('det-lines').innerHTML = lines.map(l => `
+    <tr>
+      <td>${l.description}</td>
+      <td class="text-muted">${l.quantity}</td>
+      <td class="text-muted">${fmt(l.unit_price)}</td>
+      <td><strong>${fmt(l.amount)}</strong></td>
+    </tr>
+  `).join('')
+
+  if (+inv.tax_amount > 0) {
+    document.getElementById('det-tax-row').classList.remove('hidden')
+    document.getElementById('det-tax').textContent = fmt(inv.tax_amount)
+  } else {
+    document.getElementById('det-tax-row').classList.add('hidden')
+  }
+  document.getElementById('det-total').textContent = fmt(inv.total)
+
+  const notesEl = document.getElementById('det-notes')
+  if (inv.notes) { notesEl.textContent = inv.notes; notesEl.style.display = '' }
+  else notesEl.style.display = 'none'
+
+  const payEl = document.getElementById('det-pay-btn')
+  if (inv.status !== 'paid' && inv.stripe_payment_link_url) {
+    payEl.innerHTML = `<a href="${inv.stripe_payment_link_url}" target="_blank" class="btn btn-primary" style="width:100%;justify-content:center">Pay ${fmt(inv.total)}</a>`
+  } else if (inv.status === 'paid') {
+    payEl.innerHTML = `<div style="text-align:center;color:var(--green);font-weight:600">✓ Paid on ${fmtDate(inv.paid_at)}</div>`
+  } else {
+    payEl.innerHTML = ''
+  }
+
+  document.getElementById('inv-detail-modal').classList.remove('hidden')
+}
+
+function closePortalModal() {
+  document.getElementById('inv-detail-modal').classList.add('hidden')
+}
+
+function portalLogout() {
+  localStorage.removeItem('bs_portal_token')
+  portalToken = null
+  showAuth()
+}
+
+function showError(msg) {
+  const el = document.getElementById('auth-error')
+  el.textContent = msg
+  el.classList.remove('hidden')
+}
+
+function fmt(n) {
+  return '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+}
+function fmtDate(d) {
+  if (!d) return '—'
+  return new Date(d).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+}
+
+function toast(msg, type = 'success') {
+  const t = document.getElementById('toast')
+  t.textContent = msg; t.className = `toast ${type}`
+  t.classList.remove('hidden')
+  setTimeout(() => t.classList.add('hidden'), 3000)
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape') closePortalModal()
+})
+</script>
+</body>
+</html>
