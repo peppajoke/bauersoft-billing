@@ -109,11 +109,15 @@ async function initDb() {
       company     TEXT,
       phone       TEXT,
       address     TEXT,
-      notes       TEXT,
-      created_at  TIMESTAMPTZ DEFAULT NOW(),
-      updated_at  TIMESTAMPTZ DEFAULT NOW()
+      notes               TEXT,
+      stripe_customer_id  TEXT,
+      created_at          TIMESTAMPTZ DEFAULT NOW(),
+      updated_at          TIMESTAMPTZ DEFAULT NOW()
     )
   `)
+
+  // Add stripe_customer_id if missing (safe migration)
+  await pool.query(`ALTER TABLE clients ADD COLUMN IF NOT EXISTS stripe_customer_id TEXT`)
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS magic_links (
@@ -540,26 +544,45 @@ app.post('/api/invoices/:id/send', requireAdmin, async (req, res) => {
     `SELECT * FROM invoice_line_items WHERE invoice_id=$1 ORDER BY sort_order`, [req.params.id]
   )
 
-  // Create or reuse Stripe payment link
-  let paymentUrl = invoice.stripe_payment_link_url
-  if (!paymentUrl && stripe) {
-    const price = await stripe.prices.create({
-      unit_amount: Math.round(parseFloat(invoice.total) * 100),
-      currency: invoice.currency || 'usd',
-      product_data: { name: `Invoice ${invoice.invoice_number} — BauerSoft` },
-    })
-    const link = await stripe.paymentLinks.create({
-      line_items: [{ price: price.id, quantity: 1 }],
+  // Create Stripe Checkout Session — supports both ACH (0.8% capped $5) and card
+  // New session per send so the link is always fresh
+  let paymentUrl = null
+  if (stripe) {
+    // Ensure client exists in Stripe (for ACH, Stripe needs a Customer object)
+    let stripeCustomerId = invoice.stripe_customer_id
+    if (!stripeCustomerId) {
+      const customer = await stripe.customers.create({
+        name: invoice.client_name,
+        email: invoice.client_email,
+        metadata: { client_id: invoice.client_id },
+      })
+      stripeCustomerId = customer.id
+      await pool.query(`UPDATE clients SET stripe_customer_id=$1 WHERE id=$2`, [stripeCustomerId, invoice.client_id])
+    }
+
+    const session = await stripe.checkout.sessions.create({
+      customer: stripeCustomerId,
+      payment_method_types: ['us_bank_account', 'card'], // ACH first — cheaper, then card fallback
+      line_items: [{
+        price_data: {
+          currency: invoice.currency || 'usd',
+          product_data: { name: `Invoice ${invoice.invoice_number} — BauerSoft` },
+          unit_amount: Math.round(parseFloat(invoice.total) * 100),
+        },
+        quantity: 1,
+      }],
+      mode: 'payment',
       metadata: { invoice_id: invoice.id, invoice_number: invoice.invoice_number },
-      after_completion: {
-        type: 'redirect',
-        redirect: { url: `${process.env.APP_URL || 'https://billing.bauersoft.io'}/paid?inv=${invoice.invoice_number}` },
+      success_url: `${process.env.APP_URL || 'https://billing.bauersoft.io'}/paid?inv=${invoice.invoice_number}`,
+      cancel_url: `${process.env.APP_URL || 'https://billing.bauersoft.io'}/invoices`,
+      payment_intent_data: {
+        metadata: { invoice_id: invoice.id, invoice_number: invoice.invoice_number },
       },
     })
-    paymentUrl = link.url
+    paymentUrl = session.url
     await pool.query(
-      `UPDATE invoices SET stripe_payment_link_id=$1, stripe_payment_link_url=$2, status='sent', updated_at=NOW() WHERE id=$3`,
-      [link.id, link.url, invoice.id]
+      `UPDATE invoices SET stripe_payment_link_url=$1, status='sent', updated_at=NOW() WHERE id=$2`,
+      [session.url, invoice.id]
     )
   }
 
