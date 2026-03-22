@@ -262,18 +262,38 @@ async function initDb() {
   `)
   await pool.query(`ALTER TABLE contacts ADD COLUMN IF NOT EXISTS account_id TEXT NOT NULL DEFAULT 'bauersoft'`)
 
+  // ── invoice_counters ──────────────────────────────────────────────────────
+  // Atomic per-account invoice number counter. Safer than Postgres sequences
+  // which reset to 1 on a fresh DB even when invoices already exist.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS invoice_counters (
+      account_id TEXT PRIMARY KEY,
+      last_num   INT NOT NULL DEFAULT 0
+    )
+  `)
+  // Seed from existing invoices so a re-deploy never reuses a number
+  await pool.query(`
+    INSERT INTO invoice_counters (account_id, last_num)
+    SELECT account_id, COALESCE(MAX(CAST(REPLACE(invoice_number, 'INV-', '') AS INT) FILTER (WHERE invoice_number ~ '^INV-[0-9]+$')), 0)
+    FROM invoices
+    GROUP BY account_id
+    ON CONFLICT (account_id) DO UPDATE
+      SET last_num = GREATEST(invoice_counters.last_num, EXCLUDED.last_num)
+  `)
+
   console.log('[DB] Schema ready')
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-// Atomic invoice number — Postgres sequence per account, no race condition
+// Atomic invoice number — counter table, immune to fresh-DB sequence resets
 async function nextInvoiceNumber(accountId = 'bauersoft') {
-  const seqName = `invoice_seq_${accountId.replace(/[^a-z0-9]/gi, '_')}`
-  // Create sequence if it doesn't exist (idempotent)
-  await pool.query(`CREATE SEQUENCE IF NOT EXISTS ${seqName}`)
-  const { rows } = await pool.query(`SELECT nextval($1) as n`, [seqName])
-  return `INV-${String(parseInt(rows[0].n)).padStart(4, '0')}`
+  const { rows } = await pool.query(`
+    INSERT INTO invoice_counters (account_id, last_num) VALUES ($1, 1)
+    ON CONFLICT (account_id) DO UPDATE SET last_num = invoice_counters.last_num + 1
+    RETURNING last_num
+  `, [accountId])
+  return `INV-${String(rows[0].last_num).padStart(4, '0')}`
 }
 
 // Escape HTML to prevent XSS in email bodies
@@ -283,7 +303,7 @@ function escHtml(str) {
 }
 
 // Current password version — bump JWT_SECRET to invalidate all sessions
-const PW_VERSION = process.env.ADMIN_PASSWORD ? require('crypto').createHash('sha256').update(process.env.ADMIN_PASSWORD).digest('hex').slice(0, 8) : 'default'
+const PW_VERSION = process.env.ADMIN_PASSWORD ? crypto.createHash('sha256').update(process.env.ADMIN_PASSWORD).digest('hex').slice(0, 8) : 'default'
 
 function calcTotals(lineItems, taxRate = 0) {
   const subtotal = lineItems.reduce((s, li) => s + parseFloat(li.amount || li.unit_price), 0)
@@ -297,13 +317,13 @@ function calcTotals(lineItems, taxRate = 0) {
 
 function invoiceEmailHtml(invoice, lineItems, paymentUrl) {
   const lines = lineItems.map(li =>
-    `<tr><td>${li.description}</td><td align="right">${li.quantity}</td><td align="right">$${parseFloat(li.unit_price).toFixed(2)}</td><td align="right">$${parseFloat(li.amount).toFixed(2)}</td></tr>`
+    `<tr><td>${escHtml(li.description)}</td><td align="right">${li.quantity}</td><td align="right">$${parseFloat(li.unit_price).toFixed(2)}</td><td align="right">$${parseFloat(li.amount).toFixed(2)}</td></tr>`
   ).join('')
 
   return `
   <div style="font-family:sans-serif;max-width:600px;margin:auto;color:#111">
-    <h2 style="color:#1a1a2e">Invoice ${invoice.invoice_number}</h2>
-    <p>Hi ${invoice.client_name || 'there'},</p>
+    <h2 style="color:#1a1a2e">Invoice ${escHtml(invoice.invoice_number)}</h2>
+    <p>Hi ${escHtml(invoice.client_name) || 'there'},</p>
     <p>You have a new invoice from BauerSoft for <strong>$${parseFloat(invoice.total).toFixed(2)} USD</strong>.</p>
     ${invoice.due_date ? `<p><strong>Due:</strong> ${invoice.due_date}</p>` : ''}
     <table style="width:100%;border-collapse:collapse;margin:16px 0">
@@ -344,7 +364,7 @@ app.get('/auth/verify', async (req, res) => {
     const { rows: clients } = await pool.query(`SELECT * FROM clients WHERE id=$1`, [linkRows[0].client_id])
     const client = clients[0]
     if (!client) return res.redirect('/portal.html?error=not_found')
-    const sessionToken = signToken({ clientId: client.id, email: client.email, role: 'client' }, '30d')
+    const sessionToken = signToken({ clientId: client.id, email: client.email, role: 'client' }, '7d')
     // Return JSON for JS-driven verification, or redirect with token for email clients
     const accept = req.headers.accept || ''
     if (accept.includes('application/json')) {
@@ -364,12 +384,12 @@ app.get('/health', (req, res) => res.json({ ok: true, service: 'bauersoft-billin
 // ADMIN — ACCOUNTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.get('/api/accounts', requireAdmin, async (req, res) => {
+app.get('/api/accounts', requireAdmin, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(`SELECT * FROM accounts ORDER BY created_at ASC`)
   res.json(rows)
-})
+}))
 
-app.post('/api/accounts', requireAdmin, async (req, res) => {
+app.post('/api/accounts', requireAdmin, asyncHandler(async (req, res) => {
   const { id, name, email, settings } = req.body
   if (!id || !name) return res.status(400).json({ error: 'id and name required' })
   const { rows } = await pool.query(
@@ -377,9 +397,9 @@ app.post('/api/accounts', requireAdmin, async (req, res) => {
     [id, name, email || null, JSON.stringify(settings || {})]
   )
   res.status(201).json(rows[0])
-})
+}))
 
-app.patch('/api/accounts/:id', requireAdmin, async (req, res) => {
+app.patch('/api/accounts/:id', requireAdmin, asyncHandler(async (req, res) => {
   const { name, email, stripe_account_id, settings } = req.body
   const updates = []
   const vals = [req.params.id]
@@ -392,7 +412,7 @@ app.patch('/api/accounts/:id', requireAdmin, async (req, res) => {
     `UPDATE accounts SET ${updates.join(',')}, updated_at=NOW() WHERE id=$1 RETURNING *`, vals
   )
   res.json(rows[0])
-})
+}))
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ADMIN AUTH
@@ -479,32 +499,26 @@ app.post('/auth/client/verify', asyncHandler(async (req, res) => {
 // REMOVED: /client/invoices and /client/invoices/:id were duplicates of /api/portal/*.
 // All client invoice access goes through /api/portal/* endpoints.
 
-app.get('/client/me', requireClient, asyncHandler(async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT id, name, email, company, phone FROM clients WHERE id=$1`, [req.clientId]
-  )
-  if (!rows[0]) return res.status(404).json({ error: 'Not found' })
-  res.json(rows[0])
-}))
-
-// /client/invoices and /client/invoices/:id removed — use /api/portal/invoices
+// /client/* routes removed — all client access goes through /api/portal/*
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ADMIN — CLIENTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.get('/api/clients', requireAdmin, async (req, res) => {
-  const { rows } = await pool.query(`SELECT * FROM clients ORDER BY name`)
+app.get('/api/clients', requireAdmin, asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT id, account_id, name, email, company, phone, address, created_at, updated_at FROM clients ORDER BY name`
+  )
   res.json(rows)
-})
+}))
 
-app.get('/api/clients/:id', requireAdmin, async (req, res) => {
+app.get('/api/clients/:id', requireAdmin, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(`SELECT * FROM clients WHERE id=$1`, [req.params.id])
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   res.json(rows[0])
-})
+}))
 
-app.post('/api/clients', requireAdmin, async (req, res) => {
+app.post('/api/clients', requireAdmin, asyncHandler(async (req, res) => {
   const { name, email, company, phone, address, notes } = req.body
   if (!name || !email) return res.status(400).json({ error: 'name and email required' })
   const id = uuid()
@@ -518,9 +532,9 @@ app.post('/api/clients', requireAdmin, async (req, res) => {
     if (err.code === '23505') return res.status(409).json({ error: 'Email already exists' })
     throw err
   }
-})
+}))
 
-app.patch('/api/clients/:id', requireAdmin, async (req, res) => {
+app.patch('/api/clients/:id', requireAdmin, asyncHandler(async (req, res) => {
   const allowed = ['name','email','company','phone','address','notes']
   const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k))
   if (!updates.length) return res.status(400).json({ error: 'No valid fields' })
@@ -531,7 +545,7 @@ app.patch('/api/clients/:id', requireAdmin, async (req, res) => {
   )
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   res.json(rows[0])
-})
+}))
 
 app.delete('/api/clients/:id', requireAdmin, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
@@ -559,16 +573,16 @@ app.get('/api/projects', requireAdmin, async (req, res) => {
   res.json(rows)
 })
 
-app.get('/api/projects/:id', requireAdmin, async (req, res) => {
+app.get('/api/projects/:id', requireAdmin, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT p.*, c.name as client_name FROM projects p LEFT JOIN clients c ON p.client_id=c.id WHERE p.id=$1`,
     [req.params.id]
   )
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   res.json(rows[0])
-})
+}))
 
-app.post('/api/projects', requireAdmin, async (req, res) => {
+app.post('/api/projects', requireAdmin, asyncHandler(async (req, res) => {
   const { client_id, name, description, status, type, total_value, start_date, end_date, notes } = req.body
   if (!name) return res.status(400).json({ error: 'name required' })
   const id = uuid()
@@ -579,9 +593,9 @@ app.post('/api/projects', requireAdmin, async (req, res) => {
      total_value||null, start_date||null, end_date||null, notes||null]
   )
   res.status(201).json(rows[0])
-})
+}))
 
-app.patch('/api/projects/:id', requireAdmin, async (req, res) => {
+app.patch('/api/projects/:id', requireAdmin, asyncHandler(async (req, res) => {
   const allowed = ['client_id','name','description','status','type','total_value','start_date','end_date','notes']
   const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k))
   if (!updates.length) return res.status(400).json({ error: 'No valid fields' })
@@ -592,13 +606,13 @@ app.patch('/api/projects/:id', requireAdmin, async (req, res) => {
   )
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   res.json(rows[0])
-})
+}))
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ADMIN — INVOICES
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.get('/api/invoices', requireAdmin, async (req, res) => {
+app.get('/api/invoices', requireAdmin, asyncHandler(async (req, res) => {
   const { client_id, status } = req.query
   let q = `SELECT i.*, c.name as client_name, c.email as client_email
            FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE 1=1`
@@ -607,9 +621,9 @@ app.get('/api/invoices', requireAdmin, async (req, res) => {
   if (status)    { vals.push(status);    q += ` AND i.status=$${vals.length}` }
   const { rows } = await pool.query(q + ` ORDER BY i.created_at DESC`, vals)
   res.json(rows)
-})
+}))
 
-app.get('/api/invoices/:id', requireAdmin, async (req, res) => {
+app.get('/api/invoices/:id', requireAdmin, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT i.*, c.name as client_name, c.email as client_email
      FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=$1`,
@@ -620,7 +634,7 @@ app.get('/api/invoices/:id', requireAdmin, async (req, res) => {
     `SELECT * FROM invoice_line_items WHERE invoice_id=$1 ORDER BY sort_order`, [req.params.id]
   )
   res.json({ ...rows[0], line_items: lineItems })
-})
+}))
 
 app.post('/api/invoices', requireAdmin, async (req, res) => {
   const { client_id, project_id, line_items = [], due_date, notes, tax_rate = 0, currency = 'usd', account_id = 'bauersoft' } = req.body
@@ -672,7 +686,7 @@ app.post('/api/invoices', requireAdmin, async (req, res) => {
   res.status(201).json({ ...invoice, line_items: enrichedItems })
 })
 
-app.patch('/api/invoices/:id', requireAdmin, async (req, res) => {
+app.patch('/api/invoices/:id', requireAdmin, asyncHandler(async (req, res) => {
   // 'status' intentionally excluded — use /mark-paid or /send to transition status
   const allowed = ['due_date','notes','currency']
   const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k))
@@ -684,10 +698,10 @@ app.patch('/api/invoices/:id', requireAdmin, async (req, res) => {
   )
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   res.json(rows[0])
-})
+}))
 
 // Send invoice — creates Stripe payment link + emails client
-app.post('/api/invoices/:id/send', requireAdmin, async (req, res) => {
+app.post('/api/invoices/:id/send', requireAdmin, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
     `SELECT i.*, c.name as client_name, c.email as client_email
      FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=$1`,
@@ -695,6 +709,10 @@ app.post('/api/invoices/:id/send', requireAdmin, async (req, res) => {
   )
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   const invoice = rows[0]
+
+  if (['paid', 'void'].includes(invoice.status)) {
+    return res.status(409).json({ error: `Cannot send invoice with status '${invoice.status}'` })
+  }
 
   const { rows: lineItems } = await pool.query(
     `SELECT * FROM invoice_line_items WHERE invoice_id=$1 ORDER BY sort_order`, [req.params.id]
@@ -751,22 +769,32 @@ app.post('/api/invoices/:id/send', requireAdmin, async (req, res) => {
   })
 
   res.json({ ok: true, payment_link: paymentUrl, invoice_number: invoice.invoice_number, emailed_to: invoice.client_email })
-})
+}))
 
 // Manual mark-paid (cash / bank transfer)
-app.post('/api/invoices/:id/mark-paid', requireAdmin, async (req, res) => {
+app.post('/api/invoices/:id/mark-paid', requireAdmin, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
     `UPDATE invoices SET status='paid', paid_at=NOW(), updated_at=NOW() WHERE id=$1 RETURNING *`,
     [req.params.id]
   )
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   res.json(rows[0])
-})
+}))
 
-app.delete('/api/invoices/:id', requireAdmin, async (req, res) => {
+// Void — cancels a sent invoice that won't be paid
+app.post('/api/invoices/:id/void', requireAdmin, asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `UPDATE invoices SET status='void', updated_at=NOW() WHERE id=$1 AND status NOT IN ('paid','void') RETURNING *`,
+    [req.params.id]
+  )
+  if (!rows[0]) return res.status(409).json({ error: 'Invoice not found, already paid, or already voided' })
+  res.json(rows[0])
+}))
+
+app.delete('/api/invoices/:id', requireAdmin, asyncHandler(async (req, res) => {
   await pool.query(`DELETE FROM invoices WHERE id=$1`, [req.params.id])
   res.json({ ok: true })
-})
+}))
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STRIPE WEBHOOK
@@ -841,22 +869,23 @@ app.get('/api/contacts', requireAdmin, asyncHandler(async (req, res) => {
   res.json(rows)
 }))
 
-app.patch('/api/contacts/:id', requireAdmin, async (req, res) => {
+app.patch('/api/contacts/:id', requireAdmin, asyncHandler(async (req, res) => {
   const { status } = req.body
   const { rows } = await pool.query(
     `UPDATE contacts SET status=$1 WHERE id=$2 RETURNING *`, [status, req.params.id]
   )
   res.json(rows[0])
-})
+}))
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STATS
 // ─────────────────────────────────────────────────────────────────────────────
-app.get('/api/stats', requireAdmin, async (req, res) => {
+app.get('/api/stats', requireAdmin, asyncHandler(async (req, res) => {
+  const accountId = req.query.account_id || 'bauersoft'
   const [clients, invoices, contacts] = await Promise.all([
-    pool.query(`SELECT COUNT(*) as total FROM clients`),
-    pool.query(`SELECT status, COUNT(*) as count, COALESCE(SUM(total),0) as amount FROM invoices GROUP BY status`),
-    pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE status='new') as unread FROM contacts`),
+    pool.query(`SELECT COUNT(*) as total FROM clients WHERE account_id=$1`, [accountId]),
+    pool.query(`SELECT status, COUNT(*) as count, COALESCE(SUM(total),0) as amount FROM invoices WHERE account_id=$1 GROUP BY status`, [accountId]),
+    pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE status='new') as unread FROM contacts WHERE account_id=$1`, [accountId]),
   ])
   const inv = {}
   invoices.rows.forEach(r => { inv[r.status] = { count: +r.count, amount: +r.amount } })
@@ -866,7 +895,7 @@ app.get('/api/stats', requireAdmin, async (req, res) => {
     contacts:    { total: +contacts.rows[0].total, unread: +contacts.rows[0].unread },
     revenue:     { paid: inv.paid?.amount || 0, outstanding: (inv.sent?.amount || 0) + (inv.overdue?.amount || 0) },
   })
-})
+}))
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CLIENT PORTAL API
