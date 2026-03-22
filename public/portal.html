@@ -133,7 +133,7 @@ async function verifyToken(t) {
 async function requestLink() {
   const email = document.getElementById('portal-email').value.trim()
   if (!email) return
-  const r = await fetch('/api/auth/magic-link', {
+  const r = await fetch('/auth/client/request', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email })
