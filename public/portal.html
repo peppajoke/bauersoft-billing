@@ -121,17 +121,21 @@ function showAuth() {
 async function requestLink() {
   const email = document.getElementById('portal-email').value.trim()
   if (!email) return
-  const r = await fetch('/auth/client/request', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email })
-  })
-  const d = await r.json()
-  if (!r.ok && d?.error) {
-    showError(d.error)
-  } else {
-    document.getElementById('auth-msg').textContent = 'Check your email for a login link.'
-    document.getElementById('auth-msg').classList.remove('hidden')
+  try {
+    const r = await fetch('/auth/client/request', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email })
+    })
+    const d = await r.json()
+    if (!r.ok && d?.error) {
+      showError(d.error)
+    } else {
+      document.getElementById('auth-msg').textContent = 'Check your email for a login link.'
+      document.getElementById('auth-msg').classList.remove('hidden')
+    }
+  } catch {
+    showError('Network error — check your connection and try again.')
   }
 }
 
@@ -139,11 +143,17 @@ async function showPortal() {
   document.getElementById('auth-screen').classList.add('hidden')
   document.getElementById('portal-screen').classList.remove('hidden')
 
-  const r = await fetch('/api/portal/invoices', {
-    headers: { 'Authorization': `Bearer ${portalToken}` }
-  })
-  if (r.status === 401) { portalLogout(); return }
-  const data = await r.json()
+  let data
+  try {
+    const r = await fetch('/api/portal/invoices', {
+      headers: { 'Authorization': `Bearer ${portalToken}` }
+    })
+    if (r.status === 401) { portalLogout(); return }
+    data = await r.json()
+  } catch {
+    document.getElementById('portal-invoices').innerHTML = '<p style="color:var(--red);padding:24px">Failed to load invoices — check your connection.</p>'
+    return
+  }
 
   if (data.client) {
     document.getElementById('portal-name').textContent = data.client.name
