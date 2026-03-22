@@ -8,15 +8,19 @@
  * Deploy: billing.bauersoft.io on Railway
  */
 
-const express    = require('express')
-const cors       = require('cors')
-const helmet     = require('helmet')
-const jwt        = require('jsonwebtoken')
-const { Pool }   = require('pg')
-const Stripe     = require('stripe')
+const express      = require('express')
+const cors         = require('cors')
+const helmet       = require('helmet')
+const jwt          = require('jsonwebtoken')
+const { Pool }     = require('pg')
+const Stripe       = require('stripe')
 const { v4: uuid } = require('uuid')
-const nodemailer = require('nodemailer')
-const crypto     = require('crypto')
+const nodemailer   = require('nodemailer')
+const crypto       = require('crypto')
+const rateLimit    = require('express-rate-limit')
+
+// Wrap async route handlers so errors propagate to the global error handler
+const asyncHandler = fn => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 
 require('dotenv').config()
 
@@ -55,13 +59,43 @@ async function sendEmail({ to, subject, html, text }) {
 }
 
 // ── Middleware ────────────────────────────────────────────────────────────────
-app.use(helmet({ contentSecurityPolicy: false }))
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:     ["'self'"],
+      scriptSrc:      ["'self'", "'unsafe-inline'"],   // inline scripts in HTML files
+      styleSrc:       ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
+      fontSrc:        ["'self'", 'https://fonts.gstatic.com'],
+      connectSrc:     ["'self'"],
+      imgSrc:         ["'self'", 'data:'],
+      frameSrc:       ["'none'"],
+      objectSrc:      ["'none'"],
+    },
+  },
+}))
 app.use(cors({
   origin: process.env.ALLOWED_ORIGINS?.split(',') || '*',
   credentials: true,
 }))
 app.use('/api/webhooks/stripe', express.raw({ type: 'application/json' }))
 app.use(express.json())
+
+// ── Rate limiters ─────────────────────────────────────────────────────────────
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10,
+  message: { error: 'Too many login attempts — try again in 15 minutes' },
+  standardHeaders: true, legacyHeaders: false,
+})
+const magicLinkLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 5,
+  message: { error: 'Too many magic link requests — try again in an hour' },
+  standardHeaders: true, legacyHeaders: false,
+})
+const contactLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, max: 10,
+  message: { error: 'Too many submissions — try again later' },
+  standardHeaders: true, legacyHeaders: false,
+})
 
 // ── Auth helpers ──────────────────────────────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'change-me-in-production'
@@ -357,7 +391,7 @@ app.patch('/api/accounts/:id', requireAdmin, async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Jack's browser login (returns JWT for admin dashboard)
-app.post('/auth/admin/login', (req, res) => {
+app.post('/auth/admin/login', loginLimiter, (req, res) => {
   const { password } = req.body
   if (!password || password !== process.env.ADMIN_PASSWORD) {
     return res.status(401).json({ error: 'Invalid password' })
@@ -371,7 +405,7 @@ app.post('/auth/admin/login', (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Client requests login link — sends email
-app.post('/auth/client/request', async (req, res) => {
+app.post('/auth/client/request', magicLinkLimiter, asyncHandler(async (req, res) => {
   const { email } = req.body
   if (!email) return res.status(400).json({ error: 'email required' })
 
@@ -406,66 +440,45 @@ app.post('/auth/client/request', async (req, res) => {
   })
 
   res.json({ ok: true })
-})
+}))  // end magicLinkLimiter + asyncHandler
 
 // Client verifies magic link token — returns JWT
-app.post('/auth/client/verify', async (req, res) => {
+app.post('/auth/client/verify', asyncHandler(async (req, res) => {
   const { token } = req.body
   if (!token) return res.status(400).json({ error: 'token required' })
 
+  // Atomic: only marks used if it wasn't already — prevents race condition
   const { rows } = await pool.query(
-    `SELECT ml.*, c.email FROM magic_links ml JOIN clients c ON ml.client_id=c.id
-     WHERE ml.token=$1 AND ml.used=FALSE AND ml.expires_at > NOW()`,
+    `UPDATE magic_links SET used=TRUE
+     WHERE token=$1 AND used=FALSE AND expires_at > NOW()
+     RETURNING client_id`,
     [token]
   )
   if (!rows[0]) return res.status(401).json({ error: 'Invalid or expired link' })
 
-  await pool.query(`UPDATE magic_links SET used=TRUE WHERE token=$1`, [token])
-
-  const jwt = signToken({ clientId: rows[0].client_id, email: rows[0].email, role: 'client' }, '7d')
-  res.json({ token: jwt, clientId: rows[0].client_id })
-})
+  // Get client details for the token
+  const { rows: clients } = await pool.query(`SELECT id, email FROM clients WHERE id=$1`, [rows[0].client_id])
+  const client = clients[0]
+  const sessionToken = signToken({ clientId: client.id, email: client.email, role: 'client' }, '7d')
+  res.json({ token: sessionToken, clientId: client.id })
+}))
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CLIENT PORTAL
+// CLIENT PORTAL (legacy routes — kept for backwards compat, consolidate below)
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Client views their own invoices
-app.get('/client/invoices', requireClient, async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT i.id, i.invoice_number, i.status, i.total, i.currency, i.due_date, i.paid_at,
-            i.stripe_payment_link_url, i.created_at
-     FROM invoices i WHERE i.client_id=$1 ORDER BY i.created_at DESC`,
-    [req.clientId]
-  )
-  res.json(rows)
-})
+// REMOVED: /client/invoices and /client/invoices/:id were duplicates of /api/portal/*.
+// All client invoice access goes through /api/portal/* endpoints.
 
-// Client views a specific invoice with line items
-app.get('/client/invoices/:id', requireClient, async (req, res) => {
+app.get('/client/me', requireClient, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
-    `SELECT i.*, c.name as client_name FROM invoices i
-     LEFT JOIN clients c ON i.client_id=c.id
-     WHERE i.id=$1 AND i.client_id=$2`,
-    [req.params.id, req.clientId]
-  )
-  if (!rows[0]) return res.status(404).json({ error: 'Not found' })
-  const { rows: lineItems } = await pool.query(
-    `SELECT * FROM invoice_line_items WHERE invoice_id=$1 ORDER BY sort_order`,
-    [req.params.id]
-  )
-  res.json({ ...rows[0], line_items: lineItems })
-})
-
-// Client gets their profile
-app.get('/client/me', requireClient, async (req, res) => {
-  const { rows } = await pool.query(
-    `SELECT id, name, email, company, phone FROM clients WHERE id=$1`,
-    [req.clientId]
+    `SELECT id, name, email, company, phone FROM clients WHERE id=$1`, [req.clientId]
   )
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   res.json(rows[0])
-})
+}))
+
+// /client/invoices and /client/invoices/:id removed — use /api/portal/invoices
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ADMIN — CLIENTS
@@ -607,22 +620,33 @@ app.post('/api/invoices', requireAdmin, async (req, res) => {
   const invoiceNumber = await nextInvoiceNumber(account_id)
 
   const id = uuid()
-  const { rows } = await pool.query(
-    `INSERT INTO invoices (id,account_id,invoice_number,client_id,project_id,currency,subtotal,tax_rate,tax_amount,total,due_date,notes)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-    [id, account_id, invoiceNumber, client_id, project_id||null, currency,
-     totals.subtotal, tax_rate, totals.tax_amount, totals.total, due_date||null, notes||null]
-  )
-
-  for (let i = 0; i < enrichedItems.length; i++) {
-    const li = enrichedItems[i]
-    await pool.query(
-      `INSERT INTO invoice_line_items (id,invoice_id,description,quantity,unit_price,amount,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
-      [uuid(), id, li.description, li.quantity||1, li.unit_price, li.amount, i]
+  const client = await pool.connect()
+  let invoice
+  try {
+    await client.query('BEGIN')
+    const { rows } = await client.query(
+      `INSERT INTO invoices (id,account_id,invoice_number,client_id,project_id,currency,subtotal,tax_rate,tax_amount,total,due_date,notes)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [id, account_id, invoiceNumber, client_id, project_id||null, currency,
+       totals.subtotal, tax_rate, totals.tax_amount, totals.total, due_date||null, notes||null]
     )
+    invoice = rows[0]
+    for (let i = 0; i < enrichedItems.length; i++) {
+      const li = enrichedItems[i]
+      await client.query(
+        `INSERT INTO invoice_line_items (id,invoice_id,description,quantity,unit_price,amount,sort_order) VALUES ($1,$2,$3,$4,$5,$6,$7)`,
+        [uuid(), id, li.description, li.quantity||1, li.unit_price, li.amount, i]
+      )
+    }
+    await client.query('COMMIT')
+  } catch (e) {
+    await client.query('ROLLBACK')
+    throw e
+  } finally {
+    client.release()
   }
 
-  res.status(201).json({ ...rows[0], line_items: enrichedItems })
+  res.status(201).json({ ...invoice, line_items: enrichedItems })
 })
 
 app.patch('/api/invoices/:id', requireAdmin, async (req, res) => {
@@ -763,7 +787,7 @@ app.post('/api/webhooks/stripe', async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 // CONTACT FORM (public)
 // ─────────────────────────────────────────────────────────────────────────────
-app.post('/api/contact', async (req, res) => {
+app.post('/api/contact', contactLimiter, asyncHandler(async (req, res) => {
   const { name, email, message, source } = req.body
   if (!message) return res.status(400).json({ error: 'message required' })
 
@@ -782,16 +806,16 @@ app.post('/api/contact', async (req, res) => {
   })
 
   res.json({ ok: true })
-})
+}))
 
-app.get('/api/contacts', requireAdmin, async (req, res) => {
+app.get('/api/contacts', requireAdmin, asyncHandler(async (req, res) => {
   const { status } = req.query
   const vals = []
   let q = `SELECT * FROM contacts WHERE 1=1`
   if (status) { vals.push(status); q += ` AND status=$1` }
   const { rows } = await pool.query(q + ` ORDER BY created_at DESC`, vals)
   res.json(rows)
-})
+}))
 
 app.patch('/api/contacts/:id', requireAdmin, async (req, res) => {
   const { status } = req.body
@@ -824,25 +848,34 @@ app.get('/api/stats', requireAdmin, async (req, res) => {
 // CLIENT PORTAL API
 // ─────────────────────────────────────────────────────────────────────────────
 
-// GET /api/portal/invoices — client's own invoices
-app.get('/api/portal/invoices', requireClient, async (req, res) => {
-  try {
-    const { rows: clientRows } = await pool.query(`SELECT * FROM clients WHERE id=$1`, [req.clientId])
-    const client = clientRows[0]
-    const { rows } = await pool.query(`
-      SELECT i.*,
-             json_agg(li.* ORDER BY li.sort_order) FILTER (WHERE li.id IS NOT NULL) AS line_items
-      FROM invoices i
-      LEFT JOIN invoice_line_items li ON li.invoice_id = i.id
-      WHERE i.client_id = $1 AND i.status != 'draft'
-      GROUP BY i.id
-      ORDER BY i.created_at DESC
-    `, [req.clientId])
-    res.json({ client, invoices: rows })
-  } catch(e) {
-    console.error(e); res.status(500).json({ error: 'Server error' })
-  }
-})
+// GET /api/portal/invoices — client's own invoices (single query, no double round-trip)
+app.get('/api/portal/invoices', requireClient, asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT
+      c.id as client_id, c.name as client_name, c.email as client_email,
+      c.company as client_company,
+      i.id, i.invoice_number, i.status, i.total, i.currency, i.due_date,
+      i.paid_at, i.stripe_payment_link_url, i.created_at, i.notes,
+      json_agg(li.* ORDER BY li.sort_order) FILTER (WHERE li.id IS NOT NULL) AS line_items
+    FROM clients c
+    LEFT JOIN invoices i ON i.client_id = c.id AND i.status != 'draft'
+    LEFT JOIN invoice_line_items li ON li.invoice_id = i.id
+    WHERE c.id = $1
+    GROUP BY c.id, i.id
+    ORDER BY i.created_at DESC NULLS LAST
+  `, [req.clientId])
+
+  // First row always has client info, even if no invoices
+  const client = rows[0]
+    ? { id: rows[0].client_id, name: rows[0].client_name, email: rows[0].client_email, company: rows[0].client_company }
+    : null
+  const invoices = rows.filter(r => r.id).map(r => {
+    const { client_id, client_name, client_email, client_company, ...inv } = r
+    return inv
+  })
+
+  res.json({ client, invoices })
+}))
 
 // GET /api/portal/invoices/:id — single invoice with line items
 app.get('/api/portal/invoices/:id', requireClient, async (req, res) => {
@@ -860,6 +893,17 @@ app.get('/api/portal/invoices/:id', requireClient, async (req, res) => {
   } catch(e) {
     console.error(e); res.status(500).json({ error: 'Server error' })
   }
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GLOBAL ERROR HANDLER
+// ─────────────────────────────────────────────────────────────────────────────
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+  console.error('[Error]', req.method, req.path, err.message || err)
+  if (res.headersSent) return next(err)
+  const status = err.status || err.statusCode || 500
+  res.status(status).json({ error: err.message || 'Internal server error' })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

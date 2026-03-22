@@ -201,7 +201,7 @@ async function saveClient() {
 }
 
 async function sendMagicLink(email) {
-  const r = await api('/api/auth/magic-link', { method: 'POST', body: { email } })
+  const r = await api('/auth/client/request', { method: 'POST', body: { email } })
   if (r?.error) return toast(r.error, 'error')
   toast(`Magic link sent to ${email}`)
 }
@@ -330,7 +330,7 @@ async function sendInvoice(id) {
 
 async function markPaid(id) {
   if (!confirm('Mark this invoice as paid?')) return
-  const r = await api(`/api/invoices/${id}/paid`, { method: 'POST' })
+  const r = await api(`/api/invoices/${id}/mark-paid`, { method: 'POST' })
   if (r?.error) return toast(r.error, 'error')
   toast('Marked as paid')
   loadInvoices()
