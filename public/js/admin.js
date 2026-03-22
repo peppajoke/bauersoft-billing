@@ -232,12 +232,12 @@ function openInvoiceModal() {
   // Populate client select
   const sel = document.getElementById('inv-client')
   sel.innerHTML = '<option value="">Select client...</option>' +
-    clients.map(c => `<option value="${c.id}">${c.name}${c.company ? ` (${c.company})` : ''}</option>`).join('')
+    clients.map(c => `<option value="${esc(c.id)}">${esc(c.name)}${c.company ? ` (${esc(c.company)})` : ''}</option>`).join('')
 
   // Populate project select
   const psel = document.getElementById('inv-project')
   psel.innerHTML = '<option value="">None</option>' +
-    projects.map(p => `<option value="${p.id}">${p.name}</option>`).join('')
+    projects.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('')
 
   // Default due date = 30 days out
   const due = new Date(); due.setDate(due.getDate() + 30)
@@ -353,7 +353,7 @@ function openProjectModal(id) {
   const p = id ? projects.find(x => x.id === id) : null
   const sel = document.getElementById('p-client')
   sel.innerHTML = '<option value="">None</option>' +
-    clients.map(c => `<option value="${c.id}" ${p?.client_id === c.id ? 'selected' : ''}>${c.name}</option>`).join('')
+    clients.map(c => `<option value="${esc(c.id)}" ${p?.client_id === c.id ? 'selected' : ''}>${esc(c.name)}</option>`).join('')
 
   document.getElementById('proj-modal-title').textContent = p ? 'Edit Project' : 'New Project'
   document.getElementById('proj-id').value  = p?.id || ''

@@ -904,18 +904,22 @@ app.patch('/api/contacts/:id', requireAdmin, asyncHandler(async (req, res) => {
 // ─────────────────────────────────────────────────────────────────────────────
 app.get('/api/stats', requireAdmin, asyncHandler(async (req, res) => {
   const accountId = req.query.account_id || 'bauersoft'
-  const [clients, invoices, contacts] = await Promise.all([
+  const [clients, invoices, overdueResult, contacts] = await Promise.all([
     pool.query(`SELECT COUNT(*) as total FROM clients WHERE account_id=$1`, [accountId]),
     pool.query(`SELECT status, COUNT(*) as count, COALESCE(SUM(total),0) as amount FROM invoices WHERE account_id=$1 GROUP BY status`, [accountId]),
+    // Overdue = sent invoices with a past due date (status never changes to 'overdue')
+    pool.query(`SELECT COUNT(*) as count, COALESCE(SUM(total),0) as amount FROM invoices WHERE account_id=$1 AND status='sent' AND due_date < NOW()`, [accountId]),
     pool.query(`SELECT COUNT(*) as total, COUNT(*) FILTER (WHERE status='new') as unread FROM contacts WHERE account_id=$1`, [accountId]),
   ])
   const inv = {}
   invoices.rows.forEach(r => { inv[r.status] = { count: +r.count, amount: +r.amount } })
+  const overdue = { count: +overdueResult.rows[0].count, amount: +overdueResult.rows[0].amount }
   res.json({
     clients:     +clients.rows[0].total,
     invoices:    inv,
+    overdue,
     contacts:    { total: +contacts.rows[0].total, unread: +contacts.rows[0].unread },
-    revenue:     { paid: inv.paid?.amount || 0, outstanding: (inv.sent?.amount || 0) + (inv.overdue?.amount || 0) },
+    revenue:     { paid: inv.paid?.amount || 0, outstanding: (inv.sent?.amount || 0) + overdue.amount },
   })
 }))
 

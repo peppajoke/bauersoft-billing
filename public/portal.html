@@ -127,8 +127,12 @@ async function requestLink() {
     body: JSON.stringify({ email })
   })
   const d = await r.json()
-  document.getElementById('auth-msg').textContent = 'Check your email for a login link.'
-  document.getElementById('auth-msg').classList.remove('hidden')
+  if (!r.ok && d?.error) {
+    showError(d.error)
+  } else {
+    document.getElementById('auth-msg').textContent = 'Check your email for a login link.'
+    document.getElementById('auth-msg').classList.remove('hidden')
+  }
 }
 
 async function showPortal() {
@@ -184,6 +188,8 @@ async function openInvDetail(id) {
   const r = await fetch(`/api/portal/invoices/${id}`, {
     headers: { 'Authorization': `Bearer ${portalToken}` }
   })
+  if (r.status === 401) { portalLogout(); return }
+  if (!r.ok) { toast('Could not load invoice', 'error'); return }
   const inv = await r.json()
   currentInvoice = inv
 
