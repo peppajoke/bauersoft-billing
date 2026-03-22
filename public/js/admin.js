@@ -28,7 +28,7 @@ async function doLogin() {
   const err = document.getElementById('auth-error')
   err.classList.add('hidden')
   try {
-    const r = await fetch('/api/admin/login', {
+    const r = await fetch('/auth/admin/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ password: pw })
