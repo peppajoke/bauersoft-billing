@@ -919,7 +919,8 @@ app.get('/api/stats', requireAdmin, asyncHandler(async (req, res) => {
     invoices:    inv,
     overdue,
     contacts:    { total: +contacts.rows[0].total, unread: +contacts.rows[0].unread },
-    revenue:     { paid: inv.paid?.amount || 0, outstanding: (inv.sent?.amount || 0) + overdue.amount },
+    // outstanding = all unpaid sent invoices (overdue is a subset of sent, reported separately)
+    revenue:     { paid: inv.paid?.amount || 0, outstanding: inv.sent?.amount || 0 },
   })
 }))
 
