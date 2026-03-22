@@ -131,8 +131,8 @@ async function loadDashboard() {
   const tbody = document.getElementById('recent-invoices-body')
   tbody.innerHTML = invoices.length ? invoices.slice(0, 8).map(inv => `
     <tr>
-      <td><strong>${inv.invoice_number}</strong></td>
-      <td>${inv.client_name || '—'}</td>
+      <td><strong>${esc(inv.invoice_number)}</strong></td>
+      <td>${esc(inv.client_name) || '—'}</td>
       <td>${fmt(inv.total)}</td>
       <td>${badge(inv.status)}</td>
       <td class="text-muted">${fmtDate(inv.due_date)}</td>
@@ -145,13 +145,13 @@ function renderClients() {
   const tbody = document.getElementById('clients-body')
   tbody.innerHTML = clients.length ? clients.map(c => `
     <tr>
-      <td><strong>${c.name}</strong></td>
-      <td class="text-muted">${c.company || '—'}</td>
-      <td>${c.email}</td>
+      <td><strong>${esc(c.name)}</strong></td>
+      <td class="text-muted">${esc(c.company) || '—'}</td>
+      <td>${esc(c.email)}</td>
       <td>
         <div class="gap-8">
-          <button class="btn btn-ghost btn-sm" onclick="openClientModal('${c.id}')">Edit</button>
-          <button class="btn btn-ghost btn-sm" onclick="sendMagicLink('${c.email}')">Magic Link</button>
+          <button class="btn btn-ghost btn-sm" onclick="openClientModal('${esc(c.id)}')">Edit</button>
+          <button class="btn btn-ghost btn-sm" onclick="sendMagicLink('${esc(c.email)}')">Magic Link</button>
         </div>
       </td>
     </tr>
@@ -212,16 +212,16 @@ async function loadInvoices() {
   const tbody = document.getElementById('invoices-body')
   tbody.innerHTML = inv.length ? inv.map(i => `
     <tr>
-      <td><strong>${i.invoice_number}</strong></td>
-      <td>${i.client_name || '—'}</td>
+      <td><strong>${esc(i.invoice_number)}</strong></td>
+      <td>${esc(i.client_name) || '—'}</td>
       <td>${fmt(i.total)}</td>
       <td>${badge(i.status)}</td>
       <td class="text-muted">${fmtDate(i.due_date)}</td>
       <td>
         <div class="gap-8">
-          ${i.status === 'draft' ? `<button class="btn btn-primary btn-sm" onclick="sendInvoice('${i.id}')">Send</button>` : ''}
-          ${i.status === 'sent'  ? `<button class="btn btn-ghost btn-sm" onclick="markPaid('${i.id}')">Mark Paid</button>` : ''}
-          ${i.stripe_payment_link_url ? `<a href="${i.stripe_payment_link_url}" target="_blank" class="btn btn-ghost btn-sm">Pay Link</a>` : ''}
+          ${i.status === 'draft' ? `<button class="btn btn-primary btn-sm" onclick="sendInvoice('${esc(i.id)}')">Send</button>` : ''}
+          ${i.status === 'sent'  ? `<button class="btn btn-ghost btn-sm" onclick="markPaid('${esc(i.id)}')">Mark Paid</button>` : ''}
+          ${i.stripe_payment_link_url ? `<a href="${esc(i.stripe_payment_link_url)}" target="_blank" class="btn btn-ghost btn-sm">Pay Link</a>` : ''}
         </div>
       </td>
     </tr>
@@ -340,11 +340,11 @@ function renderProjects() {
   const tbody = document.getElementById('projects-body')
   tbody.innerHTML = projects.length ? projects.map(p => `
     <tr>
-      <td><strong>${p.name}</strong></td>
-      <td class="text-muted">${p.client_name || '—'}</td>
+      <td><strong>${esc(p.name)}</strong></td>
+      <td class="text-muted">${esc(p.client_name) || '—'}</td>
       <td>${badge(p.status)}</td>
       <td>${p.total_value ? fmt(p.total_value) : '—'}</td>
-      <td><button class="btn btn-ghost btn-sm" onclick="openProjectModal('${p.id}')">Edit</button></td>
+      <td><button class="btn btn-ghost btn-sm" onclick="openProjectModal('${esc(p.id)}')">Edit</button></td>
     </tr>
   `).join('') : '<tr><td colspan="5" class="empty">No projects yet</td></tr>'
 }
@@ -390,8 +390,13 @@ async function saveProject() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+function esc(str) {
+  if (!str) return ''
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+}
+
 function badge(status) {
-  return `<span class="badge badge-${status}">${status}</span>`
+  return `<span class="badge badge-${esc(status)}">${esc(status)}</span>`
 }
 
 function closeModals() {

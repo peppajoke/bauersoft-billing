@@ -463,7 +463,7 @@ app.post('/auth/client/request', magicLinkLimiter, asyncHandler(async (req, res)
     html: `
       <div style="font-family:sans-serif;max-width:480px;margin:auto">
         <h2>Log in to BauerSoft Billing</h2>
-        <p>Hi ${client.name || 'there'}, click below to access your invoices:</p>
+        <p>Hi ${escHtml(client.name) || 'there'}, click below to access your invoices:</p>
         <p style="text-align:center;margin:24px 0">
           <a href="${loginUrl}" style="background:#4f46e5;color:white;padding:12px 24px;border-radius:6px;text-decoration:none;font-weight:bold">Log In</a>
         </p>
@@ -566,7 +566,7 @@ app.delete('/api/clients/:id', requireAdmin, asyncHandler(async (req, res) => {
 // ADMIN — PROJECTS
 // ─────────────────────────────────────────────────────────────────────────────
 
-app.get('/api/projects', requireAdmin, async (req, res) => {
+app.get('/api/projects', requireAdmin, asyncHandler(async (req, res) => {
   const { client_id, status } = req.query
   let q = `SELECT p.*, c.name as client_name FROM projects p LEFT JOIN clients c ON p.client_id=c.id WHERE 1=1`
   const vals = []
@@ -574,7 +574,7 @@ app.get('/api/projects', requireAdmin, async (req, res) => {
   if (status)    { vals.push(status);    q += ` AND p.status=$${vals.length}` }
   const { rows } = await pool.query(q + ` ORDER BY p.created_at DESC`, vals)
   res.json(rows)
-})
+}))
 
 app.get('/api/projects/:id', requireAdmin, asyncHandler(async (req, res) => {
   const { rows } = await pool.query(
@@ -639,7 +639,7 @@ app.get('/api/invoices/:id', requireAdmin, asyncHandler(async (req, res) => {
   res.json({ ...rows[0], line_items: lineItems })
 }))
 
-app.post('/api/invoices', requireAdmin, async (req, res) => {
+app.post('/api/invoices', requireAdmin, asyncHandler(async (req, res) => {
   const { client_id, project_id, line_items = [], due_date, notes, tax_rate = 0, currency = 'usd', account_id = 'bauersoft' } = req.body
   if (!client_id) return res.status(400).json({ error: 'client_id required' })
   if (!line_items.length) return res.status(400).json({ error: 'At least one line item required' })
@@ -687,7 +687,7 @@ app.post('/api/invoices', requireAdmin, async (req, res) => {
   }
 
   res.status(201).json({ ...invoice, line_items: enrichedItems })
-})
+}))
 
 app.patch('/api/invoices/:id', requireAdmin, asyncHandler(async (req, res) => {
   // 'status' intentionally excluded — use /mark-paid or /send to transition status
@@ -795,6 +795,11 @@ app.post('/api/invoices/:id/void', requireAdmin, asyncHandler(async (req, res) =
 }))
 
 app.delete('/api/invoices/:id', requireAdmin, asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(`SELECT status FROM invoices WHERE id=$1`, [req.params.id])
+  if (!rows[0]) return res.status(404).json({ error: 'Not found' })
+  if (['paid', 'void'].includes(rows[0].status)) {
+    return res.status(409).json({ error: `Cannot delete a ${rows[0].status} invoice` })
+  }
   await pool.query(`DELETE FROM invoices WHERE id=$1`, [req.params.id])
   res.json({ ok: true })
 }))
@@ -811,29 +816,34 @@ app.post('/api/webhooks/stripe', async (req, res) => {
     return res.status(400).json({ error: err.message })
   }
 
-  if (['checkout.session.completed', 'payment_intent.succeeded', 'payment_link.completed'].includes(event.type)) {
-    const obj = event.data.object
-    const invoiceId = obj.metadata?.invoice_id
-    if (invoiceId) {
-      await pool.query(
-        `UPDATE invoices SET status='paid', paid_at=NOW(), stripe_payment_intent_id=$1, updated_at=NOW() WHERE id=$2`,
-        [obj.id, invoiceId]
-      )
+  try {
+    if (['checkout.session.completed', 'payment_intent.succeeded', 'payment_link.completed'].includes(event.type)) {
+      const obj = event.data.object
+      const invoiceId = obj.metadata?.invoice_id
+      if (invoiceId) {
+        await pool.query(
+          `UPDATE invoices SET status='paid', paid_at=NOW(), stripe_payment_intent_id=$1, updated_at=NOW() WHERE id=$2`,
+          [obj.id, invoiceId]
+        )
 
-      // Get invoice + client details to send confirmation
-      const { rows } = await pool.query(
-        `SELECT i.invoice_number, c.name, c.email FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=$1`,
-        [invoiceId]
-      )
-      if (rows[0]) {
-        await sendEmail({
-          to: rows[0].email,
-          subject: `Payment received — Invoice ${rows[0].invoice_number}`,
-          html: `<p>Hi ${rows[0].name || 'there'}, your payment for Invoice ${rows[0].invoice_number} has been received. Thank you.</p><p style="color:#666;font-size:0.85em">BauerSoft</p>`,
-          text: `Payment received for Invoice ${rows[0].invoice_number}. Thank you.`,
-        })
+        // Get invoice + client details to send confirmation
+        const { rows } = await pool.query(
+          `SELECT i.invoice_number, c.name, c.email FROM invoices i LEFT JOIN clients c ON i.client_id=c.id WHERE i.id=$1`,
+          [invoiceId]
+        )
+        if (rows[0]) {
+          await sendEmail({
+            to: rows[0].email,
+            subject: `Payment received — Invoice ${rows[0].invoice_number}`,
+            html: `<p>Hi ${escHtml(rows[0].name) || 'there'}, your payment for Invoice ${escHtml(rows[0].invoice_number)} has been received. Thank you.</p><p style="color:#666;font-size:0.85em">BauerSoft</p>`,
+            text: `Payment received for Invoice ${rows[0].invoice_number}. Thank you.`,
+          })
+        }
       }
     }
+  } catch (err) {
+    console.error('[Stripe webhook] handler error:', err.message || err)
+    // Still return 200 — we received the event, internal error is our problem not Stripe's
   }
 
   res.json({ received: true })
@@ -874,9 +884,12 @@ app.get('/api/contacts', requireAdmin, asyncHandler(async (req, res) => {
 
 app.patch('/api/contacts/:id', requireAdmin, asyncHandler(async (req, res) => {
   const { status } = req.body
+  const valid = ['new', 'read', 'resolved']
+  if (!valid.includes(status)) return res.status(400).json({ error: `status must be one of: ${valid.join(', ')}` })
   const { rows } = await pool.query(
     `UPDATE contacts SET status=$1 WHERE id=$2 RETURNING *`, [status, req.params.id]
   )
+  if (!rows[0]) return res.status(404).json({ error: 'Not found' })
   res.json(rows[0])
 }))
 
