@@ -52,17 +52,22 @@ function logout() {
 
 // ── API helpers ───────────────────────────────────────────────────────────────
 async function api(path, opts = {}) {
-  const r = await fetch(API + path, {
-    ...opts,
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${token}`,
-      ...(opts.headers || {})
-    },
-    body: opts.body ? JSON.stringify(opts.body) : undefined
-  })
-  if (r.status === 401) { logout(); return null }
-  return r.json()
+  try {
+    const r = await fetch(API + path, {
+      ...opts,
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+        ...(opts.headers || {})
+      },
+      body: opts.body ? JSON.stringify(opts.body) : undefined
+    })
+    if (r.status === 401) { logout(); return null }
+    return r.json()
+  } catch {
+    toast('Network error — check your connection', 'error')
+    return null
+  }
 }
 
 function fmt(n) {
@@ -221,7 +226,7 @@ async function loadInvoices() {
         <div class="gap-8">
           ${i.status === 'draft' ? `<button class="btn btn-primary btn-sm" onclick="sendInvoice('${esc(i.id)}')">Send</button>` : ''}
           ${i.status === 'sent'  ? `<button class="btn btn-ghost btn-sm" onclick="markPaid('${esc(i.id)}')">Mark Paid</button>` : ''}
-          ${i.stripe_payment_link_url ? `<a href="${esc(i.stripe_payment_link_url)}" target="_blank" class="btn btn-ghost btn-sm">Pay Link</a>` : ''}
+          ${i.stripe_payment_link_url?.startsWith('https://') ? `<a href="${esc(i.stripe_payment_link_url)}" target="_blank" class="btn btn-ghost btn-sm">Pay Link</a>` : ''}
         </div>
       </td>
     </tr>
