@@ -117,7 +117,7 @@ const requireAdmin = (req, res, next) => {
   // Accept static API key (for Clea) or JWT (for Jack's browser session)
   if (token === process.env.ADMIN_API_KEY) return next()
   const payload = verifyToken(token)
-  if (payload?.role === 'admin') return next()
+  if (payload?.role === 'admin' && payload?.pwv === PW_VERSION) return next()
   return res.status(401).json({ error: 'Unauthorized' })
 }
 
@@ -266,15 +266,24 @@ async function initDb() {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+// Atomic invoice number — Postgres sequence per account, no race condition
 async function nextInvoiceNumber(accountId = 'bauersoft') {
-  const { rows } = await pool.query(
-    `SELECT invoice_number FROM invoices WHERE account_id=$1 ORDER BY created_at DESC LIMIT 100`,
-    [accountId]
-  )
-  const nums = rows.map(r => parseInt(r.invoice_number.replace('INV-', '')) || 0)
-  const next = nums.length ? Math.max(...nums) + 1 : 1
-  return `INV-${String(next).padStart(4, '0')}`
+  const seqName = `invoice_seq_${accountId.replace(/[^a-z0-9]/gi, '_')}`
+  // Create sequence if it doesn't exist (idempotent)
+  await pool.query(`CREATE SEQUENCE IF NOT EXISTS ${seqName}`)
+  const { rows } = await pool.query(`SELECT nextval($1) as n`, [seqName])
+  return `INV-${String(parseInt(rows[0].n)).padStart(4, '0')}`
 }
+
+// Escape HTML to prevent XSS in email bodies
+function escHtml(str) {
+  if (!str) return ''
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+}
+
+// Current password version — bump JWT_SECRET to invalidate all sessions
+const PW_VERSION = process.env.ADMIN_PASSWORD ? require('crypto').createHash('sha256').update(process.env.ADMIN_PASSWORD).digest('hex').slice(0, 8) : 'default'
 
 function calcTotals(lineItems, taxRate = 0) {
   const subtotal = lineItems.reduce((s, li) => s + parseFloat(li.amount || li.unit_price), 0)
@@ -326,14 +335,13 @@ app.get('/auth/verify', async (req, res) => {
   const { token: magicToken } = req.query
   if (!magicToken) return res.redirect('/portal.html?error=missing_token')
   try {
-    const { rows } = await pool.query(
-      `SELECT * FROM magic_links WHERE token=$1 AND used=FALSE AND expires_at > NOW()`,
+    // Atomic verify — prevents race condition from duplicate requests
+    const { rows: linkRows } = await pool.query(
+      `UPDATE magic_links SET used=TRUE WHERE token=$1 AND used=FALSE AND expires_at > NOW() RETURNING client_id`,
       [magicToken]
     )
-    if (!rows[0]) return res.redirect('/portal.html?error=expired')
-    const link = rows[0]
-    await pool.query(`UPDATE magic_links SET used=TRUE WHERE token=$1`, [magicToken])
-    const { rows: clients } = await pool.query(`SELECT * FROM clients WHERE id=$1`, [link.client_id])
+    if (!linkRows[0]) return res.redirect('/portal.html?error=expired')
+    const { rows: clients } = await pool.query(`SELECT * FROM clients WHERE id=$1`, [linkRows[0].client_id])
     const client = clients[0]
     if (!client) return res.redirect('/portal.html?error=not_found')
     const sessionToken = signToken({ clientId: client.id, email: client.email, role: 'client' }, '30d')
@@ -396,7 +404,8 @@ app.post('/auth/admin/login', loginLimiter, (req, res) => {
   if (!password || password !== process.env.ADMIN_PASSWORD) {
     return res.status(401).json({ error: 'Invalid password' })
   }
-  const token = signToken({ role: 'admin' }, '30d')
+  // Embed password version so changing ADMIN_PASSWORD invalidates all existing tokens
+  const token = signToken({ role: 'admin', pwv: PW_VERSION }, '30d')
   res.json({ token })
 })
 
@@ -524,10 +533,17 @@ app.patch('/api/clients/:id', requireAdmin, async (req, res) => {
   res.json(rows[0])
 })
 
-app.delete('/api/clients/:id', requireAdmin, async (req, res) => {
+app.delete('/api/clients/:id', requireAdmin, asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(
+    `SELECT COUNT(*) as n FROM invoices WHERE client_id=$1 AND status NOT IN ('paid','void')`,
+    [req.params.id]
+  )
+  if (+rows[0].n > 0) {
+    return res.status(409).json({ error: `Cannot delete client — ${rows[0].n} open invoice(s) exist. Resolve them first.` })
+  }
   await pool.query(`DELETE FROM clients WHERE id=$1`, [req.params.id])
   res.json({ ok: true })
-})
+}))
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ADMIN — PROJECTS
@@ -611,7 +627,14 @@ app.post('/api/invoices', requireAdmin, async (req, res) => {
   if (!client_id) return res.status(400).json({ error: 'client_id required' })
   if (!line_items.length) return res.status(400).json({ error: 'At least one line item required' })
 
-  // Compute amounts
+  // Validate + compute line items
+  for (const li of line_items) {
+    const qty   = parseFloat(li.quantity || 1)
+    const price = parseFloat(li.unit_price)
+    if (!li.description?.trim()) return res.status(400).json({ error: 'Each line item needs a description' })
+    if (isNaN(price) || price < 0) return res.status(400).json({ error: 'unit_price must be a non-negative number' })
+    if (isNaN(qty)   || qty  <= 0) return res.status(400).json({ error: 'quantity must be greater than zero' })
+  }
   const enrichedItems = line_items.map(li => ({
     ...li,
     amount: +(parseFloat(li.quantity || 1) * parseFloat(li.unit_price)).toFixed(2)
@@ -650,7 +673,8 @@ app.post('/api/invoices', requireAdmin, async (req, res) => {
 })
 
 app.patch('/api/invoices/:id', requireAdmin, async (req, res) => {
-  const allowed = ['status','due_date','notes','currency']
+  // 'status' intentionally excluded — use /mark-paid or /send to transition status
+  const allowed = ['due_date','notes','currency']
   const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k))
   if (!updates.length) return res.status(400).json({ error: 'No valid fields' })
   const fields = updates.map(([k], i) => `${k}=$${i+2}`).join(',')
@@ -801,7 +825,7 @@ app.post('/api/contact', contactLimiter, asyncHandler(async (req, res) => {
   await sendEmail({
     to: process.env.ADMIN_EMAIL || 'jackcbauerle@gmail.com',
     subject: `New contact from bauersoft.io${name ? ` — ${name}` : ''}`,
-    html: `<p><strong>Name:</strong> ${name || 'Unknown'}<br><strong>Email:</strong> ${email || 'Not provided'}</p><p>${message}</p>`,
+    html: `<p><strong>Name:</strong> ${escHtml(name) || 'Unknown'}<br><strong>Email:</strong> ${escHtml(email) || 'Not provided'}</p><p>${escHtml(message)}</p>`,
     text: `Name: ${name}\nEmail: ${email}\n\n${message}`,
   })
 
@@ -878,22 +902,18 @@ app.get('/api/portal/invoices', requireClient, asyncHandler(async (req, res) => 
 }))
 
 // GET /api/portal/invoices/:id — single invoice with line items
-app.get('/api/portal/invoices/:id', requireClient, async (req, res) => {
-  try {
-    const { rows } = await pool.query(`
-      SELECT i.*,
-             json_agg(li.* ORDER BY li.sort_order) FILTER (WHERE li.id IS NOT NULL) AS line_items
-      FROM invoices i
-      LEFT JOIN invoice_line_items li ON li.invoice_id = i.id
-      WHERE i.id = $1 AND i.client_id = $2
-      GROUP BY i.id
-    `, [req.params.id, req.clientId])
-    if (!rows[0]) return res.status(404).json({ error: 'Not found' })
-    res.json(rows[0])
-  } catch(e) {
-    console.error(e); res.status(500).json({ error: 'Server error' })
-  }
-})
+app.get('/api/portal/invoices/:id', requireClient, asyncHandler(async (req, res) => {
+  const { rows } = await pool.query(`
+    SELECT i.*,
+           json_agg(li.* ORDER BY li.sort_order) FILTER (WHERE li.id IS NOT NULL) AS line_items
+    FROM invoices i
+    LEFT JOIN invoice_line_items li ON li.invoice_id = i.id
+    WHERE i.id = $1 AND i.client_id = $2
+    GROUP BY i.id
+  `, [req.params.id, req.clientId])
+  if (!rows[0]) return res.status(404).json({ error: 'Not found' })
+  res.json(rows[0])
+}))
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GLOBAL ERROR HANDLER

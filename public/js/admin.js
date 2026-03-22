@@ -116,27 +116,20 @@ async function loadAll() {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 async function loadDashboard() {
-  const [invoices, c] = await Promise.all([api('/api/invoices'), api('/api/clients')])
-  if (!invoices) return
-  clients = c || []
+  const [stats, recent] = await Promise.all([
+    api('/api/stats'),
+    api('/api/invoices?limit=8'),
+  ])
+  if (!stats) return
 
-  const outstanding = invoices.filter(i => i.status === 'sent').reduce((s, i) => s + +i.total, 0)
-  const now = new Date()
-  const paidThisMonth = invoices.filter(i => {
-    if (i.status !== 'paid' || !i.paid_at) return false
-    const d = new Date(i.paid_at)
-    return d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear()
-  }).reduce((s, i) => s + +i.total, 0)
-  const open = invoices.filter(i => ['draft','sent'].includes(i.status)).length
+  document.getElementById('stat-outstanding').textContent = fmt(stats.revenue?.outstanding || 0)
+  document.getElementById('stat-paid').textContent = fmt(stats.revenue?.paid || 0)
+  document.getElementById('stat-open').textContent = (stats.invoices?.draft?.count || 0) + (stats.invoices?.sent?.count || 0)
+  document.getElementById('stat-clients').textContent = stats.clients || 0
 
-  document.getElementById('stat-outstanding').textContent = fmt(outstanding)
-  document.getElementById('stat-paid').textContent = fmt(paidThisMonth)
-  document.getElementById('stat-open').textContent = open
-  document.getElementById('stat-clients').textContent = clients.length
-
-  const recent = [...invoices].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 8)
+  const invoices = recent || []
   const tbody = document.getElementById('recent-invoices-body')
-  tbody.innerHTML = recent.length ? recent.map(inv => `
+  tbody.innerHTML = invoices.length ? invoices.slice(0, 8).map(inv => `
     <tr>
       <td><strong>${inv.invoice_number}</strong></td>
       <td>${inv.client_name || '—'}</td>
@@ -201,8 +194,14 @@ async function saveClient() {
 }
 
 async function sendMagicLink(email) {
-  const r = await api('/auth/client/request', { method: 'POST', body: { email } })
-  if (r?.error) return toast(r.error, 'error')
+  // Public endpoint — no auth header needed
+  const r = await fetch('/auth/client/request', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email })
+  })
+  const d = await r.json()
+  if (d?.error) return toast(d.error, 'error')
   toast(`Magic link sent to ${email}`)
 }
 
