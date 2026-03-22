@@ -373,7 +373,8 @@ app.get('/auth/verify', async (req, res) => {
     if (accept.includes('application/json')) {
       return res.json({ token: sessionToken, client: { id: client.id, name: client.name, email: client.email } })
     }
-    res.redirect(`/portal.html?session=${sessionToken}`)
+    // Hash fragment — not sent to servers, not in access logs, not in Referer headers
+    res.redirect(`/portal.html#session=${sessionToken}`)
   } catch(e) {
     console.error('verify error:', e)
     res.redirect('/portal.html?error=server')
@@ -542,12 +543,17 @@ app.patch('/api/clients/:id', requireAdmin, asyncHandler(async (req, res) => {
   const updates = Object.entries(req.body).filter(([k]) => allowed.includes(k))
   if (!updates.length) return res.status(400).json({ error: 'No valid fields' })
   const fields = updates.map(([k], i) => `${k}=$${i+2}`).join(',')
-  const { rows } = await pool.query(
-    `UPDATE clients SET ${fields}, updated_at=NOW() WHERE id=$1 RETURNING *`,
-    [req.params.id, ...updates.map(([,v]) => v)]
-  )
-  if (!rows[0]) return res.status(404).json({ error: 'Not found' })
-  res.json(rows[0])
+  try {
+    const { rows } = await pool.query(
+      `UPDATE clients SET ${fields}, updated_at=NOW() WHERE id=$1 RETURNING *`,
+      [req.params.id, ...updates.map(([,v]) => v)]
+    )
+    if (!rows[0]) return res.status(404).json({ error: 'Not found' })
+    res.json(rows[0])
+  } catch (err) {
+    if (err.code === '23505') return res.status(409).json({ error: 'Email already exists' })
+    throw err
+  }
 }))
 
 app.delete('/api/clients/:id', requireAdmin, asyncHandler(async (req, res) => {
@@ -927,7 +933,7 @@ app.get('/api/portal/invoices', requireClient, asyncHandler(async (req, res) => 
       i.paid_at, i.stripe_payment_link_url, i.created_at, i.notes,
       json_agg(li.* ORDER BY li.sort_order) FILTER (WHERE li.id IS NOT NULL) AS line_items
     FROM clients c
-    LEFT JOIN invoices i ON i.client_id = c.id AND i.status != 'draft'
+    LEFT JOIN invoices i ON i.client_id = c.id AND i.status NOT IN ('draft', 'void')
     LEFT JOIN invoice_line_items li ON li.invoice_id = i.id
     WHERE c.id = $1
     GROUP BY c.id, i.id
@@ -953,7 +959,7 @@ app.get('/api/portal/invoices/:id', requireClient, asyncHandler(async (req, res)
            json_agg(li.* ORDER BY li.sort_order) FILTER (WHERE li.id IS NOT NULL) AS line_items
     FROM invoices i
     LEFT JOIN invoice_line_items li ON li.invoice_id = i.id
-    WHERE i.id = $1 AND i.client_id = $2
+    WHERE i.id = $1 AND i.client_id = $2 AND i.status NOT IN ('draft', 'void')
     GROUP BY i.id
   `, [req.params.id, req.clientId])
   if (!rows[0]) return res.status(404).json({ error: 'Not found' })

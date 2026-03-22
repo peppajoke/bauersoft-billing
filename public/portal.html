@@ -88,13 +88,17 @@ const API = ''
 let portalToken = localStorage.getItem('bs_portal_token')
 let currentInvoice = null
 
+// Escape HTML to prevent XSS in innerHTML
+function esc(str) {
+  if (!str) return ''
+  return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')
+}
+
 window.onload = async () => {
   const params = new URLSearchParams(window.location.search)
-  // Magic link token (JS-driven verify via fetch)
-  const magicToken = params.get('token')
-  if (magicToken) { await verifyToken(magicToken); return }
-  // Session token injected by server redirect (for plain email clients)
-  const sessionToken = params.get('session')
+  // Session token from server redirect — stored in hash fragment (not query) to keep it out of logs/referrer
+  const hash = new URLSearchParams(window.location.hash.slice(1))
+  const sessionToken = hash.get('session')
   if (sessionToken) {
     portalToken = sessionToken
     localStorage.setItem('bs_portal_token', portalToken)
@@ -112,22 +116,6 @@ function showAuth() {
   document.getElementById('portal-email').addEventListener('keydown', e => {
     if (e.key === 'Enter') requestLink()
   })
-}
-
-async function verifyToken(t) {
-  try {
-    const r = await fetch(`/auth/verify?token=${t}`)
-    const d = await r.json()
-    if (!r.ok) throw new Error(d.error || 'Invalid link')
-    portalToken = d.token
-    localStorage.setItem('bs_portal_token', portalToken)
-    // Clean URL
-    history.replaceState({}, '', '/portal.html')
-    showPortal()
-  } catch(e) {
-    showAuth()
-    showError(e.message)
-  }
 }
 
 async function requestLink() {
@@ -170,11 +158,13 @@ async function showPortal() {
     const isOverdue = !isPaid && inv.due_date && new Date(inv.due_date) < new Date()
     const statusClass = isPaid ? 'badge-paid' : isOverdue ? 'badge-overdue' : 'badge-sent'
     const statusLabel = isPaid ? 'Paid' : isOverdue ? 'Overdue' : 'Due'
+    // Only allow known-safe Stripe URLs in href; everything else escaped
+    const payHref = inv.stripe_payment_link_url?.startsWith('https://') ? esc(inv.stripe_payment_link_url) : ''
     return `
-    <div class="invoice-card" style="cursor:pointer" onclick="openInvDetail('${inv.id}')">
+    <div class="invoice-card" style="cursor:pointer" onclick="openInvDetail('${esc(inv.id)}')">
       <div class="inv-info">
-        <h3>${inv.invoice_number}</h3>
-        <p>${inv.notes ? inv.notes.substring(0, 60) : 'Click to view details'}</p>
+        <h3>${esc(inv.invoice_number)}</h3>
+        <p>${inv.notes ? esc(inv.notes.substring(0, 60)) : 'Click to view details'}</p>
       </div>
       <div style="display:flex;align-items:center;gap:16px">
         <span class="badge ${statusClass}">${statusLabel}</span>
@@ -182,8 +172,8 @@ async function showPortal() {
           ${fmt(inv.total)}
           <small>${inv.due_date ? 'Due ' + fmtDate(inv.due_date) : ''}</small>
         </div>
-        ${!isPaid && inv.stripe_payment_link_url
-          ? `<a href="${inv.stripe_payment_link_url}" target="_blank" class="btn btn-primary btn-sm" onclick="event.stopPropagation()">Pay Now</a>`
+        ${!isPaid && payHref
+          ? `<a href="${payHref}" target="_blank" class="btn btn-primary btn-sm" onclick="event.stopPropagation()">Pay Now</a>`
           : ''}
       </div>
     </div>
@@ -198,14 +188,14 @@ async function openInvDetail(id) {
   currentInvoice = inv
 
   document.getElementById('det-number').textContent = inv.invoice_number
-  document.getElementById('det-status').innerHTML = `<span class="badge badge-${inv.status}">${inv.status}</span>`
+  document.getElementById('det-status').innerHTML = `<span class="badge badge-${esc(inv.status)}">${esc(inv.status)}</span>`
   document.getElementById('det-issued').textContent = fmtDate(inv.created_at)
   document.getElementById('det-due').textContent = fmtDate(inv.due_date)
 
   const lines = inv.line_items || []
   document.getElementById('det-lines').innerHTML = lines.map(l => `
     <tr>
-      <td>${l.description}</td>
+      <td>${esc(l.description)}</td>
       <td class="text-muted">${l.quantity}</td>
       <td class="text-muted">${fmt(l.unit_price)}</td>
       <td><strong>${fmt(l.amount)}</strong></td>
@@ -225,8 +215,9 @@ async function openInvDetail(id) {
   else notesEl.style.display = 'none'
 
   const payEl = document.getElementById('det-pay-btn')
-  if (inv.status !== 'paid' && inv.stripe_payment_link_url) {
-    payEl.innerHTML = `<a href="${inv.stripe_payment_link_url}" target="_blank" class="btn btn-primary" style="width:100%;justify-content:center">Pay ${fmt(inv.total)}</a>`
+  const detPayHref = inv.stripe_payment_link_url?.startsWith('https://') ? esc(inv.stripe_payment_link_url) : ''
+  if (inv.status !== 'paid' && detPayHref) {
+    payEl.innerHTML = `<a href="${detPayHref}" target="_blank" class="btn btn-primary" style="width:100%;justify-content:center">Pay ${fmt(inv.total)}</a>`
   } else if (inv.status === 'paid') {
     payEl.innerHTML = `<div style="text-align:center;color:var(--green);font-weight:600">✓ Paid on ${fmtDate(inv.paid_at)}</div>`
   } else {
