@@ -274,7 +274,10 @@ async function initDb() {
   // Seed from existing invoices so a re-deploy never reuses a number
   await pool.query(`
     INSERT INTO invoice_counters (account_id, last_num)
-    SELECT account_id, COALESCE(MAX(CAST(REPLACE(invoice_number, 'INV-', '') AS INT) FILTER (WHERE invoice_number ~ '^INV-[0-9]+$')), 0)
+    SELECT account_id,
+      COALESCE(MAX(CASE WHEN invoice_number ~ '^INV-[0-9]+$'
+        THEN CAST(REPLACE(invoice_number, 'INV-', '') AS INT)
+        ELSE 0 END), 0)
     FROM invoices
     GROUP BY account_id
     ON CONFLICT (account_id) DO UPDATE
