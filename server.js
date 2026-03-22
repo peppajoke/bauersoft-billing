@@ -364,15 +364,12 @@ app.get('/auth/verify', async (req, res) => {
       [magicToken]
     )
     if (!linkRows[0]) return res.redirect('/portal.html?error=expired')
-    const { rows: clients } = await pool.query(`SELECT * FROM clients WHERE id=$1`, [linkRows[0].client_id])
+    const { rows: clients } = await pool.query(
+      `SELECT id, email, name FROM clients WHERE id=$1`, [linkRows[0].client_id]
+    )
     const client = clients[0]
     if (!client) return res.redirect('/portal.html?error=not_found')
     const sessionToken = signToken({ clientId: client.id, email: client.email, role: 'client' }, '7d')
-    // Return JSON for JS-driven verification, or redirect with token for email clients
-    const accept = req.headers.accept || ''
-    if (accept.includes('application/json')) {
-      return res.json({ token: sessionToken, client: { id: client.id, name: client.name, email: client.email } })
-    }
     // Hash fragment — not sent to servers, not in access logs, not in Referer headers
     res.redirect(`/portal.html#session=${sessionToken}`)
   } catch(e) {

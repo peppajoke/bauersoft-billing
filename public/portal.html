@@ -115,7 +115,7 @@ function showAuth() {
   document.getElementById('portal-screen').classList.add('hidden')
   document.getElementById('portal-email').addEventListener('keydown', e => {
     if (e.key === 'Enter') requestLink()
-  })
+  }, { once: true })
 }
 
 async function requestLink() {
@@ -195,12 +195,17 @@ async function showPortal() {
 }
 
 async function openInvDetail(id) {
-  const r = await fetch(`/api/portal/invoices/${id}`, {
-    headers: { 'Authorization': `Bearer ${portalToken}` }
-  })
-  if (r.status === 401) { portalLogout(); return }
-  if (!r.ok) { toast('Could not load invoice', 'error'); return }
-  const inv = await r.json()
+  let inv
+  try {
+    const r = await fetch(`/api/portal/invoices/${id}`, {
+      headers: { 'Authorization': `Bearer ${portalToken}` }
+    })
+    if (r.status === 401) { portalLogout(); return }
+    if (!r.ok) { toast('Could not load invoice', 'error'); return }
+    inv = await r.json()
+  } catch {
+    toast('Network error — could not load invoice', 'error'); return
+  }
   currentInvoice = inv
 
   document.getElementById('det-number').textContent = inv.invoice_number
